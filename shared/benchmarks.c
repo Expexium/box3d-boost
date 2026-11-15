@@ -1302,6 +1302,258 @@ float GetSpinnerAngle( void )
 	return b3RevoluteJoint_GetAngle( g_spinnerData.spinnerId );
 }
 
+// Deep pile of ragdolls dropped into a walled pit. This stresses joints, capsule contacts and the
+// broad-phase all at once. Sleeping is disabled so every step measures the fully awake pile.
+#ifdef NDEBUG
+#define RAGDOLL_PILE_COUNT_X 8
+#define RAGDOLL_PILE_COUNT_Z 16
+#define RAGDOLL_PILE_LAYERS 16
+#else
+#define RAGDOLL_PILE_COUNT_X 3
+#define RAGDOLL_PILE_COUNT_Z 4
+#define RAGDOLL_PILE_LAYERS 2
+#endif
+
+#define RAGDOLL_PILE_COUNT ( RAGDOLL_PILE_COUNT_X * RAGDOLL_PILE_COUNT_Z * RAGDOLL_PILE_LAYERS )
+
+static Human* g_ragdollPileHumans;
+
+void GetRagdollPileCapacity( b3Capacity* capacity )
+{
+	capacity->staticShapeCount = 8;
+	capacity->staticBodyCount = 1;
+	capacity->dynamicBodyCount = bone_count * RAGDOLL_PILE_COUNT;
+	capacity->dynamicShapeCount = ( bone_count + 2 ) * RAGDOLL_PILE_COUNT;
+	capacity->contactCount = 16 * bone_count * RAGDOLL_PILE_COUNT;
+}
+
+void CreateRagdollPile( b3WorldId worldId )
+{
+	float spacingX = 0.9f;
+	float spacingZ = 0.5f;
+	float spacingY = 1.9f;
+
+	float halfX = 0.5f * spacingX * RAGDOLL_PILE_COUNT_X + 0.4f;
+	float halfZ = 0.5f * spacingZ * RAGDOLL_PILE_COUNT_Z + 0.4f;
+	float wallHeight = 0.5f * spacingY * RAGDOLL_PILE_LAYERS + 2.0f;
+	float wallThickness = 1.0f;
+
+	{
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+		// Floor with its top face at y = 0
+		b3BoxHull box = b3MakeOffsetBoxHull( halfX + 2.0f * wallThickness, 1.0f, halfZ + 2.0f * wallThickness, (b3Vec3){ 0.0f, -1.0f, 0.0f } );
+		g_groundShapeId = b3CreateHullShape( groundId, &shapeDef, &box.base );
+
+		// Four walls keep the ragdolls stacked on top of each other
+		box = b3MakeOffsetBoxHull( wallThickness, wallHeight, halfZ + 2.0f * wallThickness, (b3Vec3){ halfX + wallThickness, wallHeight, 0.0f } );
+		b3CreateHullShape( groundId, &shapeDef, &box.base );
+
+		box = b3MakeOffsetBoxHull( wallThickness, wallHeight, halfZ + 2.0f * wallThickness, (b3Vec3){ -halfX - wallThickness, wallHeight, 0.0f } );
+		b3CreateHullShape( groundId, &shapeDef, &box.base );
+
+		box = b3MakeOffsetBoxHull( halfX + 2.0f * wallThickness, wallHeight, wallThickness, (b3Vec3){ 0.0f, wallHeight, halfZ + wallThickness } );
+		b3CreateHullShape( groundId, &shapeDef, &box.base );
+
+		box = b3MakeOffsetBoxHull( halfX + 2.0f * wallThickness, wallHeight, wallThickness, (b3Vec3){ 0.0f, wallHeight, -halfZ - wallThickness } );
+		b3CreateHullShape( groundId, &shapeDef, &box.base );
+	}
+
+	g_ragdollPileHumans = malloc( RAGDOLL_PILE_COUNT * sizeof( Human ) );
+	memset( g_ragdollPileHumans, 0, RAGDOLL_PILE_COUNT * sizeof( Human ) );
+
+	// Fixed seed so every run builds the same pile
+	g_randomSeed = 42;
+
+	float frictionTorque = 5.0f;
+	float hertz = 1.0f;
+	float dampingRatio = 0.7f;
+	bool colorize = false;
+
+	int index = 0;
+	for ( int layer = 0; layer < RAGDOLL_PILE_LAYERS; ++layer )
+	{
+		for ( int z = 0; z < RAGDOLL_PILE_COUNT_Z; ++z )
+		{
+			for ( int x = 0; x < RAGDOLL_PILE_COUNT_X; ++x )
+			{
+				// A little jitter breaks the grid symmetry so the ragdolls tumble
+				float jitterX = RandomFloatRange( -0.05f, 0.05f );
+				float jitterZ = RandomFloatRange( -0.05f, 0.05f );
+
+				b3Pos position;
+				position.x = ( (float)x - 0.5f * (float)( RAGDOLL_PILE_COUNT_X - 1 ) ) * spacingX + jitterX;
+				position.y = 0.25f + spacingY * (float)layer;
+				position.z = ( (float)z - 0.5f * (float)( RAGDOLL_PILE_COUNT_Z - 1 ) ) * spacingZ + jitterZ;
+
+				// The group index disables some self collision, it must be non-zero to be active
+				int groupIndex = index + 1;
+				CreateHuman( g_ragdollPileHumans + index, worldId, position, frictionTorque, hertz, dampingRatio, groupIndex, NULL,
+							 colorize );
+				index += 1;
+			}
+		}
+	}
+
+	b3World_EnableSleeping( worldId, false );
+}
+
+void DestroyRagdollPile( void )
+{
+	free( g_ragdollPileHumans );
+	g_ragdollPileHumans = NULL;
+}
+
+// Thousands of convex hulls scattered over a field. Unlike a pile, each body mostly touches the ground
+// and only now and then a neighbor, so this measures the cost per body rather than the cost per contact.
+// The bodies are dropped with some velocity and spin, tumble for a while, and come to rest. Sleeping is
+// disabled so the resting bodies keep simulating, which is the worst case for a scene like this.
+#define CONVEX_FIELD_COUNT_X 80
+#define CONVEX_FIELD_COUNT_Z 80
+#define CONVEX_FIELD_COUNT ( CONVEX_FIELD_COUNT_X * CONVEX_FIELD_COUNT_Z )
+#define CONVEX_FIELD_SPACING 2.5f
+
+static b3HeightFieldData* g_convexFieldHeightField;
+
+// Local generator so the scene does not depend on what ran before it. Returns a value in [0, 1).
+static float ConvexFieldRandom( uint32_t* state )
+{
+	*state = *state * 1664525u + 1013904223u;
+	return (float)( *state >> 8 ) * ( 1.0f / 16777216.0f );
+}
+
+void GetConvexFieldCapacity( b3Capacity* capacity )
+{
+	capacity->staticShapeCount = 1;
+	capacity->staticBodyCount = 1;
+	capacity->dynamicBodyCount = CONVEX_FIELD_COUNT;
+	capacity->dynamicShapeCount = CONVEX_FIELD_COUNT;
+	capacity->contactCount = 4 * CONVEX_FIELD_COUNT;
+}
+
+static void CreateConvexFieldBodies( b3WorldId worldId )
+{
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.35f, 0.6f );
+	b3HullData* rock = b3CreateRock( 0.7f );
+	b3HullData* complex = b3CreateComplexHull( 0.7f );
+	b3HullData* cylinder = b3CreateCylinder( 1.0f, 0.45f, -0.5f, 10 );
+	const b3HullData* hulls[4] = { &box.base, rock, complex, cylinder };
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+	uint32_t state = 12345;
+	float halfX = 0.5f * CONVEX_FIELD_SPACING * ( CONVEX_FIELD_COUNT_X - 1 );
+	float halfZ = 0.5f * CONVEX_FIELD_SPACING * ( CONVEX_FIELD_COUNT_Z - 1 );
+
+	for ( int z = 0; z < CONVEX_FIELD_COUNT_Z; ++z )
+	{
+		for ( int x = 0; x < CONVEX_FIELD_COUNT_X; ++x )
+		{
+			float jitterX = ConvexFieldRandom( &state ) - 0.5f;
+			float jitterZ = ConvexFieldRandom( &state ) - 0.5f;
+			float height = 2.0f + 2.0f * ConvexFieldRandom( &state );
+
+			b3Vec3 axis = { ConvexFieldRandom( &state ) - 0.5f, ConvexFieldRandom( &state ) - 0.5f, ConvexFieldRandom( &state ) - 0.5f };
+			axis = b3Normalize( axis );
+			if ( b3LengthSquared( axis ) < 0.5f )
+			{
+				axis = (b3Vec3){ 0.0f, 1.0f, 0.0f };
+			}
+
+			float angle = 2.0f * B3_PI * ConvexFieldRandom( &state );
+
+			bodyDef.position = (b3Pos){ CONVEX_FIELD_SPACING * x - halfX + jitterX, height, CONVEX_FIELD_SPACING * z - halfZ + jitterZ };
+			bodyDef.rotation = b3MakeQuatFromAxisAngle( axis, angle );
+			bodyDef.linearVelocity = (b3Vec3){ 6.0f * ( ConvexFieldRandom( &state ) - 0.5f ), 0.0f, 6.0f * ( ConvexFieldRandom( &state ) - 0.5f ) };
+			bodyDef.angularVelocity = (b3Vec3){ 8.0f * ( ConvexFieldRandom( &state ) - 0.5f ), 8.0f * ( ConvexFieldRandom( &state ) - 0.5f ),
+												8.0f * ( ConvexFieldRandom( &state ) - 0.5f ) };
+
+			b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+			b3CreateHullShape( bodyId, &shapeDef, hulls[( x + 3 * z ) % 4] );
+		}
+	}
+
+	b3DestroyHull( rock );
+	b3DestroyHull( complex );
+	b3DestroyHull( cylinder );
+
+	b3World_EnableSleeping( worldId, false );
+}
+
+// The field is one large box
+void CreateConvexField( b3WorldId worldId )
+{
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.position = (b3Pos){ 0.0f, -1.0f, 0.0f };
+	b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+
+	float halfExtent = 0.5f * CONVEX_FIELD_SPACING * CONVEX_FIELD_COUNT_X + 20.0f;
+	b3BoxHull box = b3MakeBoxHull( halfExtent, 1.0f, halfExtent );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	g_groundShapeId = b3CreateHullShape( groundId, &shapeDef, &box.base );
+
+	CreateConvexFieldBodies( worldId );
+}
+
+// The field is a height field with gentle hills, like a terrain
+void CreateConvexFieldTerrain( b3WorldId worldId )
+{
+	float cellWidth = 1.0f;
+	int cellCount = (int)( CONVEX_FIELD_SPACING * CONVEX_FIELD_COUNT_X ) + 40;
+	int pointCount = cellCount + 1;
+
+	float* heights = malloc( pointCount * pointCount * sizeof( float ) );
+	uint8_t* materialIndices = calloc( cellCount * cellCount, sizeof( uint8_t ) );
+
+	float omegaX = 2.0f * B3_PI * 0.1f * cellWidth;
+	float omegaZ = 2.0f * B3_PI * 0.05f * cellWidth;
+	for ( int iz = 0; iz < pointCount; ++iz )
+	{
+		float sz = b3ComputeCosSin( omegaZ * iz ).sine;
+		for ( int ix = 0; ix < pointCount; ++ix )
+		{
+			float sx = b3ComputeCosSin( omegaX * ix ).sine;
+			heights[iz * pointCount + ix] = sx * sz;
+		}
+	}
+
+	b3HeightFieldDef hfDef = { 0 };
+	hfDef.heights = heights;
+	hfDef.materialIndices = materialIndices;
+	hfDef.scale = (b3Vec3){ cellWidth, 0.4f, cellWidth };
+	hfDef.countX = pointCount;
+	hfDef.countZ = pointCount;
+	hfDef.globalMinimumHeight = -1.0f;
+	hfDef.globalMaximumHeight = 1.0f;
+	hfDef.clockwiseWinding = false;
+
+	g_convexFieldHeightField = b3CreateHeightField( &hfDef );
+	free( heights );
+	free( materialIndices );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.position = (b3Pos){ -0.5f * cellWidth * cellCount, 0.0f, -0.5f * cellWidth * cellCount };
+	b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHeightFieldShape( groundId, &shapeDef, g_convexFieldHeightField );
+
+	CreateConvexFieldBodies( worldId );
+}
+
+void DestroyConvexField( void )
+{
+	if ( g_convexFieldHeightField != NULL )
+	{
+		b3DestroyHeightField( g_convexFieldHeightField );
+		g_convexFieldHeightField = NULL;
+	}
+}
+
 #define SLEEP_PYRAMID_COUNT 10
 
 typedef struct

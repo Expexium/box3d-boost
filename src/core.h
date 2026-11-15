@@ -133,8 +133,12 @@ typedef struct b3AtomicI64
 	_Alignas( 8 ) int64_t value;
 } b3AtomicI64;
 
-// Minimum memory alignment used for all allocations
-#define B3_ALIGNMENT 32
+// Size of a cache line on the platforms this runs on
+#define B3_CACHE_LINE_SIZE 64
+
+// Minimum memory alignment used for all allocations. Arrays start on a cache line so that cache aligned
+// elements stay cache aligned.
+#define B3_ALIGNMENT B3_CACHE_LINE_SIZE
 
 #define B3_RESTRICT restrict
 

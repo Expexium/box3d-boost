@@ -52,6 +52,9 @@ void b3WakeSolverSet( b3World* world, int setIndex )
 		body->setIndex = b3_awakeSet;
 		body->localIndex = awakeSet->bodySims.count;
 
+		// End any contact skip records of the awake sim index this body is taking
+		b3BumpBodyEpoch( world, simSrc->bodyId );
+
 		// Reset sleep timer
 		body->sleepTime = 0.0f;
 
@@ -420,6 +423,9 @@ void b3TrySleepIsland( b3World* world, int islandId )
 			b3JointSim* sleepJointSim = b3Array_Emplace( sleepSet->jointSims );
 			memcpy( sleepJointSim, awakeJointSim, sizeof( b3JointSim ) );
 
+			// The joint solver layout holds indices into this array
+			color->jointLayoutDirty = true;
+
 			int movedIndex = b3Array_RemoveSwap( color->jointSims, localIndex );
 			if ( movedIndex != B3_NULL_INDEX )
 			{
@@ -609,6 +615,9 @@ void b3TransferBody( b3World* world, b3SolverSet* targetSet, b3SolverSet* source
 
 	body->setIndex = targetSet->setIndex;
 	body->localIndex = targetIndex;
+
+	// End any contact skip records of the sim index this body is taking
+	b3BumpBodyEpoch( world, body->id );
 }
 
 void b3TransferJoint( b3World* world, b3SolverSet* targetSet, b3SolverSet* sourceSet, b3Joint* joint )

@@ -1371,6 +1371,9 @@ static void b3ResetProxy( b3World* world, b3Shape* shape, bool wakeBodies, bool 
 		}
 	}
 
+	// The bounding box changes below, so contacts of this body cannot be skipped by the narrow phase
+	b3BumpBodyEpoch( world, shape->bodyId );
+
 	b3WorldTransform transform = b3GetBodyTransformQuick( world, body );
 	if ( shape->proxyKey != B3_NULL_INDEX )
 	{

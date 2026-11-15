@@ -1064,6 +1064,7 @@ void b3UpdateBodyMassData( b3World* world, b3Body* body )
 	}
 
 	// When the center of mass changes, any cached contact manifold becomes invalid.
+	b3BumpBodyEpoch( world, body->id );
 	int edgeKey = body->headContactKey;
 	while ( edgeKey != B3_NULL_INDEX )
 	{
@@ -1154,6 +1155,9 @@ void b3Body_SetTransform( b3BodyId bodyId, b3Pos position, b3Quat rotation )
 
 	b3Body* body = b3GetBodyFullId( world, bodyId );
 	b3BodySim* bodySim = b3GetBodySim( world, body );
+
+	// The body may be static or sleeping, so the narrow phase cannot detect this motion by itself
+	b3BumpBodyEpoch( world, body->id );
 
 	bodySim->transform.p = position;
 	bodySim->transform.q = rotation;
@@ -1611,6 +1615,9 @@ void b3Body_SetType( b3BodyId bodyId, b3BodyType type )
 		return;
 	}
 
+	// The body changes solver set and how its extent is used by contact recycling
+	b3BumpBodyEpoch( world, body->id );
+
 	if ( type != b3_staticBody )
 	{
 		int shapeId = body->headShapeId;
@@ -1967,6 +1974,7 @@ void b3Body_SetMassData( b3BodyId bodyId, b3MassData massData )
 	}
 
 	// When the center of mass changes, any cached contact manifold becomes invalid.
+	b3BumpBodyEpoch( world, body->id );
 	int edgeKey = body->headContactKey;
 	while ( edgeKey != B3_NULL_INDEX )
 	{

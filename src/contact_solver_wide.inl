@@ -117,6 +117,71 @@ static inline b3Vec3W b3InvRotateVectorW( b3QuatW q, b3Vec3W a )
 }
 
 // Soft contact constraints with sub-stepping support
+// The helpers below are exact transcriptions of scalar functions: the same operations in the same
+// order, so each lane gets bit for bit the scalar result. The scalar counterpart is named above each.
+// They are shared by the wide solvers that are included after this file.
+
+// b3MulMV. This uses all nine elements because the scalar solver does and the world inertia is
+// not perfectly symmetric.
+static inline b3Vec3W b3MulMVJW( b3Matrix3W m, b3Vec3W a )
+{
+	b3Vec3W b = {
+		b3AddW( b3AddW( b3MulW( m.cx.X, a.X ), b3MulW( m.cy.X, a.Y ) ), b3MulW( m.cz.X, a.Z ) ),
+		b3AddW( b3AddW( b3MulW( m.cx.Y, a.X ), b3MulW( m.cy.Y, a.Y ) ), b3MulW( m.cz.Y, a.Z ) ),
+		b3AddW( b3AddW( b3MulW( m.cx.Z, a.X ), b3MulW( m.cy.Z, a.Y ) ), b3MulW( m.cz.Z, a.Z ) ),
+	};
+
+	return b;
+}
+
+// b3MulQuat
+static inline b3QuatW b3MulQuatJW( b3QuatW q1, b3QuatW q2 )
+{
+	b3Vec3W t1 = b3CrossW( q1.V, q2.V );
+	b3Vec3W t2 = b3MulAddSVW( t1, q1.S, q2.V );
+	b3Vec3W t3 = b3MulAddSVW( t2, q2.S, q1.V );
+	return (b3QuatW){ t3, b3SubW( b3MulW( q1.S, q2.S ), b3DotW( q1.V, q2.V ) ) };
+}
+
+// b3AbsFloat: a < 0 ? -a : a
+static inline b3FloatW b3AbsJW( b3FloatW a )
+{
+	return b3BlendW( a, b3NegW( a ), b3LessThanW( a, b3ZeroW() ) );
+}
+
+// b3ModifiedCross
+static inline b3Vec3W b3ModifiedCrossJW( b3Vec3W a, b3Vec3W b )
+{
+	return (b3Vec3W){
+		b3AddW( b3MulW( a.Y, b.Z ), b3MulW( a.Z, b.Y ) ),
+		b3AddW( b3MulW( a.Z, b.X ), b3MulW( a.X, b.Z ) ),
+		b3AddW( b3MulW( a.X, b.Y ), b3MulW( a.Y, b.X ) ),
+	};
+}
+
+// b3MakeMatrixFromQuat
+static inline b3Matrix3W b3MakeMatrixFromQuatJW( b3QuatW q )
+{
+	b3FloatW one = b3SplatW( 1.0f );
+	b3FloatW two = b3SplatW( 2.0f );
+
+	b3FloatW xx = b3MulW( q.V.X, q.V.X );
+	b3FloatW yy = b3MulW( q.V.Y, q.V.Y );
+	b3FloatW zz = b3MulW( q.V.Z, q.V.Z );
+	b3FloatW xy = b3MulW( q.V.X, q.V.Y );
+	b3FloatW xz = b3MulW( q.V.X, q.V.Z );
+	b3FloatW xw = b3MulW( q.V.X, q.S );
+	b3FloatW yz = b3MulW( q.V.Y, q.V.Z );
+	b3FloatW yw = b3MulW( q.V.Y, q.S );
+	b3FloatW zw = b3MulW( q.V.Z, q.S );
+
+	return (b3Matrix3W){
+		{ b3SubW( one, b3MulW( two, b3AddW( yy, zz ) ) ), b3MulW( two, b3AddW( xy, zw ) ), b3MulW( two, b3SubW( xz, yw ) ) },
+		{ b3MulW( two, b3SubW( xy, zw ) ), b3SubW( one, b3MulW( two, b3AddW( xx, zz ) ) ), b3MulW( two, b3AddW( yz, xw ) ) },
+		{ b3MulW( two, b3AddW( xz, yw ) ), b3MulW( two, b3SubW( yz, xw ) ), b3SubW( one, b3MulW( two, b3AddW( xx, yy ) ) ) },
+	};
+}
+
 // Uses fixed anchors for Jacobians for better behavior on rolling shapes (circles & capsules)
 // http://mmacklin.com/smallsteps.pdf
 // https://box2d.org/files/ErinCatto_SoftConstraints_GDC2011.pdf
@@ -208,6 +273,32 @@ typedef struct B3_WIDE( b3BodyState )
 	b3Vec3W dp;
 	b3QuatW dq;
 } b3BodyStateW;
+
+// Are all body indices of a wide constraint side null? That is the case for a group of contacts with
+// static bodies, such as bodies resting on the ground. Gathering then gives the identity state in
+// every lane and scattering writes nothing, so both can skip their work.
+B3_FORCE_INLINE bool b3AllNullBodies( const int* B3_RESTRICT indices )
+{
+	int any = 0;
+	for ( int i = 0; i < B3_SIMD_WIDTH; ++i )
+	{
+		any |= indices[i];
+	}
+
+	return any == 0;
+}
+
+// What b3GatherBodies returns when every index is null
+B3_FORCE_INLINE b3BodyStateW b3GatherNullBodies( void )
+{
+	b3FloatW zero = b3ZeroW();
+	b3BodyStateW s;
+	s.v = (b3Vec3W){ zero, zero, zero };
+	s.w = (b3Vec3W){ zero, zero, zero };
+	s.dp = (b3Vec3W){ zero, zero, zero };
+	s.dq = (b3QuatW){ { zero, zero, zero }, b3SplatW( 1.0f ) };
+	return s;
+}
 
 #if defined( B3_SIMD_NONE )
 
@@ -302,6 +393,11 @@ _Static_assert( offsetof( b3BodyState, linearVelocity ) == 0 && offsetof( b3Body
 
 B3_FORCE_INLINE b3BodyStateW b3GatherBodies( const b3BodyState* B3_RESTRICT states, const int* B3_RESTRICT indices )
 {
+	if ( b3AllNullBodies( indices ) )
+	{
+		return b3GatherNullBodies();
+	}
+
 	const float* identity = (const float*)&b3_identityBodyState;
 
 	// Indices are 0 for null
@@ -348,6 +444,11 @@ B3_FORCE_INLINE void b3StoreBodyVelocity( b3BodyState* B3_RESTRICT states, int i
 B3_FORCE_INLINE void b3ScatterBodies( b3BodyState* B3_RESTRICT states, const int* B3_RESTRICT indices,
 									  const b3BodyStateW* B3_RESTRICT simdBody )
 {
+	if ( b3AllNullBodies( indices ) )
+	{
+		return;
+	}
+
 	// I don't use any dummy body in the body array because this will lead to multithreaded sharing and the
 	// associated cache flushing.
 	b3FloatW zero = b3ZeroW();
@@ -369,6 +470,11 @@ B3_FORCE_INLINE void b3ScatterBodies( b3BodyState* B3_RESTRICT states, const int
 
 B3_FORCE_INLINE b3BodyStateW b3GatherBodies( const b3BodyState* B3_RESTRICT states, const int* B3_RESTRICT indices )
 {
+	if ( b3AllNullBodies( indices ) )
+	{
+		return b3GatherNullBodies();
+	}
+
 	const float* identity = (const float*)&b3_identityBodyState;
 
 	// Indices are 0 for null
@@ -410,6 +516,11 @@ B3_FORCE_INLINE void b3StoreBodyVelocity( b3BodyState* B3_RESTRICT states, int i
 B3_FORCE_INLINE void b3ScatterBodies( b3BodyState* B3_RESTRICT states, const int* B3_RESTRICT indices,
 									  const b3BodyStateW* B3_RESTRICT simdBody )
 {
+	if ( b3AllNullBodies( indices ) )
+	{
+		return;
+	}
+
 	// I don't use any dummy body in the body array because this will lead to multithreaded sharing and the
 	// associated cache flushing.
 	b3FloatW zero = b3ZeroW();
@@ -581,6 +692,8 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 	int manifoldCounts[B3_SIMD_WIDTH];
 	int hitEventLanes = 0;
 	int maxManifoldCount = 0;
+	b3RefreshFlag* refreshFlags = context->world->contactRefreshFlags.data;
+	int refreshLanes = 0;
 
 	for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
 	{
@@ -591,6 +704,32 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 		{
 			int indexA = b3DecodeAwakeIndex( contact->encodedBodySimA );
 			int indexB = b3DecodeAwakeIndex( contact->encodedBodySimB );
+
+			// The narrow phase recycled or skipped this contact and left the manifold refresh for below.
+			// Start pulling in what the refresh reads for all lanes before refreshing any of them, so
+			// the cache misses overlap.
+			if ( refreshFlags[contact->contactId] != 0 )
+			{
+				refreshLanes |= 1 << lane;
+
+				// The normal and the first two points
+				const char* manifold = (const char*)contact->manifolds;
+				b3Prefetch( manifold );
+				b3Prefetch( manifold + B3_CACHE_LINE_SIZE );
+				b3Prefetch( manifold + 2 * B3_CACHE_LINE_SIZE );
+
+				// The refresh reads the transform and center in the first cache line of the body sim. A
+				// static body is usually shared by many contacts and stays in the cache.
+				if ( indexA != B3_NULL_INDEX )
+				{
+					b3Prefetch( sims + indexA );
+				}
+
+				if ( indexB != B3_NULL_INDEX )
+				{
+					b3Prefetch( sims + indexB );
+				}
+			}
 
 #if B3_ENABLE_VALIDATION
 			b3Body* bodyA = bodies + contact->edges[0].bodyId;
@@ -624,6 +763,79 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 	B3_VALIDATE( maxManifoldCount == manifoldCount );
 	B3_UNUSED( maxManifoldCount );
 	c->manifoldCount = manifoldCount;
+
+	// Deferred manifold refresh, this is here because the contact, manifold, and bodies are needed anyway.
+	// This sets up what b3RefreshRecycledContact computes once per contact: the rotation of each body
+	// since the manifold was computed and the vector between the body centers. The separations are
+	// refreshed further down where the manifold points are loaded.
+	// The flag is consumed so a contact that the narrow phase does not visit next step, because it fell
+	// asleep, is not refreshed again.
+	b3Matrix3W refreshMatrixA = { 0 };
+	b3Matrix3W refreshMatrixB = { 0 };
+	b3Vec3W refreshDelta = { zeroW, zeroW, zeroW };
+	b3FloatW refreshMask = zeroW;
+	if ( refreshLanes != 0 )
+	{
+		const b3BodySim* refreshSimsA[B3_SIMD_WIDTH];
+		const b3BodySim* refreshSimsB[B3_SIMD_WIDTH];
+		_Alignas( B3_WIDE_ALIGNMENT ) float deltaX[B3_SIMD_WIDTH];
+		_Alignas( B3_WIDE_ALIGNMENT ) float deltaY[B3_SIMD_WIDTH];
+		_Alignas( B3_WIDE_ALIGNMENT ) float deltaZ[B3_SIMD_WIDTH];
+		int refreshLaneFlags[B3_SIMD_WIDTH];
+
+		for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+		{
+			if ( refreshLanes & ( 1 << lane ) )
+			{
+				// These can be static bodies, which the lookups above replace with a zero body
+				b3Contact* contact = contacts[lane];
+				b3GetContactBodySims( context->world, contact, refreshSimsA + lane, refreshSimsB + lane );
+
+				// Minimize round-off
+				b3Vec3 dc = b3SubPos( refreshSimsB[lane]->center, refreshSimsA[lane]->center );
+				deltaX[lane] = dc.x;
+				deltaY[lane] = dc.y;
+				deltaZ[lane] = dc.z;
+				refreshLaneFlags[lane] = 1;
+				refreshFlags[contact->contactId] = 0;
+			}
+			else
+			{
+				refreshSimsA[lane] = &b3_zeroBodySim;
+				refreshSimsB[lane] = &b3_zeroBodySim;
+				deltaX[lane] = 0.0f;
+				deltaY[lane] = 0.0f;
+				deltaZ[lane] = 0.0f;
+				refreshLaneFlags[lane] = 0;
+			}
+		}
+
+		b3QuatW qA, qB, cachedA, cachedB;
+		B3_GATHER_LANES( qA.V.X, refreshSimsA, transform.q.v.x );
+		B3_GATHER_LANES( qA.V.Y, refreshSimsA, transform.q.v.y );
+		B3_GATHER_LANES( qA.V.Z, refreshSimsA, transform.q.v.z );
+		B3_GATHER_LANES( qA.S, refreshSimsA, transform.q.s );
+		B3_GATHER_LANES( qB.V.X, refreshSimsB, transform.q.v.x );
+		B3_GATHER_LANES( qB.V.Y, refreshSimsB, transform.q.v.y );
+		B3_GATHER_LANES( qB.V.Z, refreshSimsB, transform.q.v.z );
+		B3_GATHER_LANES( qB.S, refreshSimsB, transform.q.s );
+		B3_GATHER_LANES( cachedA.V.X, contactLanes, cachedRotationA.v.x );
+		B3_GATHER_LANES( cachedA.V.Y, contactLanes, cachedRotationA.v.y );
+		B3_GATHER_LANES( cachedA.V.Z, contactLanes, cachedRotationA.v.z );
+		B3_GATHER_LANES( cachedA.S, contactLanes, cachedRotationA.s );
+		B3_GATHER_LANES( cachedB.V.X, contactLanes, cachedRotationB.v.x );
+		B3_GATHER_LANES( cachedB.V.Y, contactLanes, cachedRotationB.v.y );
+		B3_GATHER_LANES( cachedB.V.Z, contactLanes, cachedRotationB.v.z );
+		B3_GATHER_LANES( cachedB.S, contactLanes, cachedRotationB.s );
+
+		// b3MulQuat( q, b3Conjugate( cached ) )
+		b3QuatW conjugateA = { b3NegVW( cachedA.V ), cachedA.S };
+		b3QuatW conjugateB = { b3NegVW( cachedB.V ), cachedB.S };
+		refreshMatrixA = b3MakeMatrixFromQuatJW( b3MulQuatJW( qA, conjugateA ) );
+		refreshMatrixB = b3MakeMatrixFromQuatJW( b3MulQuatJW( qB, conjugateB ) );
+		refreshDelta = (b3Vec3W){ b3LoadW( deltaX ), b3LoadW( deltaY ), b3LoadW( deltaZ ) };
+		refreshMask = b3GreaterThanW( b3IntsToFloatW( refreshLaneFlags ), zeroW );
+	}
 
 	b3FloatW mA, mB;
 	B3_GATHER_LANES( mA, simLanesA, invMass );
@@ -762,6 +974,35 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 						  &normalImpulse );
 #endif
 
+			if ( refreshLanes != 0 )
+			{
+				// The rest of b3RefreshRecycledContact. Keep anchors but update separation, same as
+				// sub-stepping. This eliminates jitter.
+				b3FloatW baseSeparation;
+				B3_GATHER_LANES( baseSeparation, manifoldLanes, points[pointIndex].baseSeparation );
+
+				b3Vec3W rotatedA = b3MulMVJW( refreshMatrixA, rA );
+				b3Vec3W rotatedB = b3MulMVJW( refreshMatrixB, rB );
+				b3Vec3W dp = b3AddVW( refreshDelta, b3SubVW( rotatedB, rotatedA ) );
+				b3FloatW refreshed = b3AddW( baseSeparation, b3DotW( dp, normal ) );
+				separation = b3BlendW( separation, refreshed, refreshMask );
+
+				// The manifold keeps the refreshed separation
+				_Alignas( B3_WIDE_ALIGNMENT ) float refreshedLanes[B3_SIMD_WIDTH];
+				b3StoreW( refreshedLanes, refreshed );
+				for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+				{
+					if ( ( refreshLanes & ( 1 << lane ) ) != 0 && pointIndex < pointCounts[lane] )
+					{
+						// The lane manifolds are only const because a missing lane uses a shared zero manifold
+						b3ManifoldPoint* mp = (b3ManifoldPoint*)manifoldLanes[lane]->points + pointIndex;
+						mp->separation = refreshedLanes[lane];
+						mp->normalVelocity = 0.0f;
+						mp->persisted = true;
+					}
+				}
+			}
+
 			rA.X = b3BlendW( zeroW, rA.X, pointMask );
 			rA.Y = b3BlendW( zeroW, rA.Y, pointMask );
 			rA.Z = b3BlendW( zeroW, rA.Z, pointMask );
@@ -885,6 +1126,58 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 	return haveRestitution;
 }
 
+// Preparing a wide constraint reads a contact, its manifold, and two body sims per lane, all scattered
+// across memory. These two prefetch the first two cache lines of the contacts of a wide constraint, and
+// then, once those have arrived, what the contacts point at. Called one and two wide constraints ahead
+// so the cache misses overlap with the preparation of the current one.
+// first: index of the first contact of the wide constraint in the color
+// count: number of contacts in the color
+static inline void b3PrefetchPrepareContactsW( const b3Contact* contacts, const int* contactIds, int first, int count )
+{
+	int end = b3MinInt( first + B3_SIMD_WIDTH, count );
+	for ( int i = first; i < end; ++i )
+	{
+		const char* contact = (const char*)( contacts + contactIds[i] );
+		b3Prefetch( contact );
+		b3Prefetch( contact + B3_CACHE_LINE_SIZE );
+	}
+}
+
+static inline void b3PrefetchPrepareDependentsW( const b3Contact* contacts, const int* contactIds, int first, int count,
+												 const b3BodySim* sims )
+{
+	int end = b3MinInt( first + B3_SIMD_WIDTH, count );
+	for ( int i = first; i < end; ++i )
+	{
+		const b3Contact* contact = contacts + contactIds[i];
+
+		// The normal and the first two points
+		const char* manifold = (const char*)contact->manifolds;
+		b3Prefetch( manifold );
+		b3Prefetch( manifold + B3_CACHE_LINE_SIZE );
+		b3Prefetch( manifold + 2 * B3_CACHE_LINE_SIZE );
+
+		// The inverse mass and inverse inertia
+		int indexA = b3DecodeAwakeIndex( contact->encodedBodySimA );
+		int indexB = b3DecodeAwakeIndex( contact->encodedBodySimB );
+		if ( indexA != B3_NULL_INDEX )
+		{
+			const char* massData = (const char*)&sims[indexA].invInertiaWorld;
+			b3Prefetch( massData );
+			b3Prefetch( massData + sizeof( b3Matrix3 ) + sizeof( float ) - 1 );
+		}
+
+		if ( indexB != B3_NULL_INDEX )
+		{
+			const char* massData = (const char*)&sims[indexB].invInertiaWorld;
+			b3Prefetch( massData );
+			b3Prefetch( massData + sizeof( b3Matrix3 ) + sizeof( float ) - 1 );
+		}
+	}
+}
+
+_Static_assert( offsetof( b3BodySim, invMass ) == offsetof( b3BodySim, invInertiaWorld ) + sizeof( b3Matrix3 ), "body sim layout" );
+
 void B3_WIDE( b3PrepareContacts_Convex )( b3SolverBlock block, b3StepContext* context )
 {
 	b3TracyCZoneNC( prepare_contact, "Prepare Contact", b3_colorYellow, true );
@@ -912,12 +1205,24 @@ void B3_WIDE( b3PrepareContacts_Convex )( b3SolverBlock block, b3StepContext* co
 		int colorWideEndIndex = b3MinInt( spans[colorIndex + 1].start, endWideIndex );
 		int colorContactCount = spans[colorIndex].count;
 		int* contactIds = spans[colorIndex].contacts;
+		const b3Contact* allContacts = world->contacts.data;
+
+		// Start the look ahead for this color
+		{
+			int first = B3_SIMD_WIDTH * ( wideIndex - colorWideStart );
+			b3PrefetchPrepareContactsW( allContacts, contactIds, first, colorContactCount );
+			b3PrefetchPrepareContactsW( allContacts, contactIds, first + B3_SIMD_WIDTH, colorContactCount );
+		}
 
 		// Loop over color
 		for ( ; wideIndex < colorWideEndIndex; ++wideIndex )
 		{
 			b3ContactConstraintWide* c = b3GetConstraintW( wideBase, NULL, wideIndex, 1 );
 			int localWideIndex = wideIndex - colorWideStart;
+
+			b3PrefetchPrepareContactsW( allContacts, contactIds, B3_SIMD_WIDTH * ( localWideIndex + 2 ), colorContactCount );
+			b3PrefetchPrepareDependentsW( allContacts, contactIds, B3_SIMD_WIDTH * ( localWideIndex + 1 ), colorContactCount,
+										  context->sims );
 
 			b3Contact* contacts[B3_SIMD_WIDTH];
 			for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
@@ -1485,6 +1790,37 @@ B3_FORCE_INLINE void b3StoreImpulsesW( b3SolverBlock block, b3StepContext* conte
 	{
 		int manifoldCount = fixedManifoldCount > 0 ? fixedManifoldCount : c->manifoldCount;
 		const b3ContactManifoldWide* manifolds = b3GetManifoldsW( c );
+
+		// The impulses are written to manifolds scattered across memory and each manifold is found through
+		// its contact. Ask for the contacts two wide constraints ahead and the manifolds one ahead so the
+		// cache misses overlap. This needs the fixed stride of the convex constraints.
+		if ( fixedManifoldCount > 0 )
+		{
+			if ( i + 2 < block.count )
+			{
+				const b3ContactConstraintWide* ahead = b3GetConstraintW( base, NULL, block.startIndex + i + 2, fixedManifoldCount );
+				for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+				{
+					b3Prefetch( ahead->contacts[lane] );
+				}
+			}
+
+			if ( i + 1 < block.count )
+			{
+				const b3ContactConstraintWide* ahead = b3GetConstraintW( base, NULL, block.startIndex + i + 1, fixedManifoldCount );
+				for ( int lane = 0; lane < B3_SIMD_WIDTH; ++lane )
+				{
+					const b3Contact* contact = ahead->contacts[lane];
+					if ( contact != NULL )
+					{
+						const char* manifold = (const char*)contact->manifolds;
+						b3Prefetch( manifold );
+						b3Prefetch( manifold + B3_CACHE_LINE_SIZE );
+						b3Prefetch( manifold + 2 * B3_CACHE_LINE_SIZE );
+					}
+				}
+			}
+		}
 
 		// Pay the cache misses up front.
 		b3Manifold* laneManifolds[B3_SIMD_WIDTH];

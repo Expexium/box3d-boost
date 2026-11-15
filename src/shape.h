@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core.h"
 #include "math_internal.h"
 
 #include "box3d/collision.h"
@@ -24,35 +25,19 @@ typedef enum b3ShapeFlags
 	b3_enableSpeculative = 0x40,
 } b3ShapeFlags;
 
+// The fields are grouped by who reads them. The narrow phase reads the type and geometry from the first
+// cache line and, for a touching contact, the materials from the second. Shapes are stored in a cache
+// aligned array.
 typedef struct b3Shape
 {
-	int id;
-	int bodyId;
-	int prevShapeId;
-	int nextShapeId;
-	int sensorIndex;
-	int proxyKey;
-	b3ShapeType type;
-	float density;
-	float explosionScale;
-	float aabbMargin;
+	// First cache line
 
-	b3AABB aabb;
-	b3Vec3 localCentroid;
-
-	int materialCount;
-	b3SurfaceMaterial material;
-	b3SurfaceMaterial* materials;
-
-	b3Filter filter;
-	void* userData;
-	void* userShape;
-
-	uint32_t nameId;
-	uint16_t generation;
+	_Alignas( B3_CACHE_LINE_SIZE ) b3ShapeType type;
 
 	// b3ShapeFlags
 	uint8_t flags;
+
+	uint16_t generation;
 
 	union
 	{
@@ -64,6 +49,31 @@ typedef struct b3Shape
 		const b3CompoundData* compound;
 	};
 
+	int bodyId;
+	int id;
+	int proxyKey;
+	int sensorIndex;
+	float aabbMargin;
+	int materialCount;
+
+	// Second cache line
+
+	b3SurfaceMaterial* materials;
+	b3SurfaceMaterial material;
+	b3Vec3 localCentroid;
+	uint32_t nameId;
+
+	// Third cache line
+
+	b3Filter filter;
+	b3AABB aabb;
+	int prevShapeId;
+	int nextShapeId;
+	float density;
+	float explosionScale;
+
+	void* userData;
+	void* userShape;
 } b3Shape;
 
 // A single material shape keeps its material inline. Multi material meshes and compounds own a heap
@@ -119,6 +129,11 @@ int b3CollideMover( b3PlaneResult* planes, int planeCapacity, const b3Shape* sha
 
 // Hull
 int b3FindHullSupportVertex( const b3HullData* hull, b3Vec3 direction );
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+int b3FindHullSupportVertexW8( const b3HullData* hull, b3Vec3 direction );
+int b3FindTriangleHullEdgePairW8( const b3Vec3* trianglePoints, const b3Vec3* triangleEdges, b3Vec3 triNormal,
+								  const b3HullData* hull, int* processedCount );
+#endif
 int b3FindHullSupportFace( const b3HullData* hull, b3Vec3 direction );
 bool b3IsValidHull( const b3HullData* hull );
 b3AABB b3ComputeSweptHullAABB( const b3HullData* shape, b3Transform xf1, b3Transform xf2 );

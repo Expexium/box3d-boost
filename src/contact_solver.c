@@ -77,6 +77,15 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			b3Contact* contact = b3Array_Get( world->contacts, contactId );
 			B3_ASSERT( contact->contactId == contactId );
 
+			// The narrow phase recycled or skipped this contact and left the manifold refresh for here.
+			// The flag is consumed so a contact that the narrow phase does not visit next step, because
+			// it fell asleep, is not refreshed again.
+			if ( world->contactRefreshFlags.data[contactId] != 0 )
+			{
+				b3RefreshRecycledContact( world, contact );
+				world->contactRefreshFlags.data[contactId] = 0;
+			}
+
 			int indexA = b3DecodeAwakeIndex( contact->encodedBodySimA );
 			int indexB = b3DecodeAwakeIndex( contact->encodedBodySimB );
 

@@ -50,6 +50,8 @@ b3AxisQuery b3ComputeSeparatingAxisAtWidth( const b3HullData* hullA, const b3Hul
 											int simdWidth );
 void b3CollideHullsAtWidth( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, const b3HullData* hullB,
 							b3Transform transformBtoA, b3SATCache* cache, int simdWidth );
+bool b3IsSeparatedByCachedAxis( const b3HullData* hullA, const b3HullData* hullB, b3Transform transformBtoA,
+								const b3SATCache* cache );
 
 void b3BuildTriangleAndCapsuleFaceContact( b3LocalManifold* manifold, const b3Vec3* triangle, b3Plane plane,
 										   const b3Capsule* capsule );

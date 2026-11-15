@@ -6,6 +6,7 @@
 #include "core.h"
 #include "manifold.h"
 #include "shape.h"
+#include "simd.h"
 
 #include "box3d/base.h"
 #include "box3d/collision.h"
@@ -605,8 +606,41 @@ static b3SeparatingAxis b3QueryTriangleAndHullEdges( const b3TriangleData* trian
 	const b3Plane* hullPlanes = b3GetHullPlanes( hull );
 	int edgeCount = hull->edgeCount;
 	float squaredTolerance = 0.005f * 0.005f;
+	int firstEdge = 0;
 
-	for ( int i = 0; i < edgeCount; i += 2 )
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( b3GetSIMDWidth() == 8 )
+	{
+		// Search most of the edges eight at a time. This only finds the best pair. Its result is then
+		// computed below with the same code as the loop, so it is exactly what the loop would produce.
+		int code = b3FindTriangleHullEdgePairW8( trianglePoints, triangleEdges, triNormal, hull, &firstEdge );
+		if ( code >= 0 )
+		{
+			int i = code >> 2;
+			int j = code & 3;
+
+			const b3HullHalfEdge* edge = hullEdges + i;
+			const b3HullHalfEdge* twin = hullEdges + i + 1;
+			b3Vec3 hullPoint = hullPoints[edge->origin];
+			b3Vec3 hullNormal1 = hullPlanes[edge->face].normal;
+			b3Vec3 hullNormal2 = hullPlanes[twin->face].normal;
+			b3Vec3 triEdge = triangleEdges[j];
+
+			float cab = b3Dot( hullNormal1, triEdge );
+			float dab = b3Dot( hullNormal2, triEdge );
+			float t = cab / ( cab - dab );
+			b3Vec3 axis = b3Lerp( hullNormal1, hullNormal2, t );
+			axis = b3Normalize( axis );
+
+			result.normal = b3Neg( axis );
+			result.separation = b3Dot( axis, b3Sub( trianglePoints[j], hullPoint ) );
+			result.indexA = j;
+			result.indexB = i;
+		}
+	}
+#endif
+
+	for ( int i = firstEdge; i < edgeCount; i += 2 )
 	{
 		const b3HullHalfEdge* edge = hullEdges + i;
 		const b3HullHalfEdge* twin = hullEdges + i + 1;

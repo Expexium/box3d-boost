@@ -46,6 +46,64 @@ typedef struct Benchmark
 	int totalStepCount;
 } Benchmark;
 
+// Sum the stage timings over a run so the cost of each stage can be compared between builds
+static void AddProfile( b3Profile* p1, const b3Profile* p2 )
+{
+	p1->step += p2->step;
+	p1->pairs += p2->pairs;
+	p1->collide += p2->collide;
+	p1->solve += p2->solve;
+	p1->solverSetup += p2->solverSetup;
+	p1->constraints += p2->constraints;
+	p1->prepareConstraints += p2->prepareConstraints;
+	p1->integrateVelocities += p2->integrateVelocities;
+	p1->warmStart += p2->warmStart;
+	p1->solveImpulses += p2->solveImpulses;
+	p1->integratePositions += p2->integratePositions;
+	p1->relaxImpulses += p2->relaxImpulses;
+	p1->restitution += p2->restitution;
+	p1->storeImpulses += p2->storeImpulses;
+	p1->splitIslands += p2->splitIslands;
+	p1->transforms += p2->transforms;
+	p1->sensorHits += p2->sensorHits;
+	p1->jointEvents += p2->jointEvents;
+	p1->hitEvents += p2->hitEvents;
+	p1->refit += p2->refit;
+	p1->bullets += p2->bullets;
+	p1->sleepIslands += p2->sleepIslands;
+	p1->sensors += p2->sensors;
+}
+
+static void PrintProfile( const b3Profile* p )
+{
+	printf( "  step %.1f | pairs %.1f | collide %.1f | solve %.1f\n", p->step, p->pairs, p->collide, p->solve );
+	printf( "  solve: setup %.1f | constraints %.1f | transforms %.1f | refit %.1f | bullets %.1f | sleep %.1f | split %.1f\n",
+			p->solverSetup, p->constraints, p->transforms, p->refit, p->bullets, p->sleepIslands, p->splitIslands );
+	printf( "  constraints: prepare %.1f | intVel %.1f | warm %.1f | solve %.1f | intPos %.1f | relax %.1f | restitution %.1f | "
+			"store %.1f\n",
+			p->prepareConstraints, p->integrateVelocities, p->warmStart, p->solveImpulses, p->integratePositions,
+			p->relaxImpulses, p->restitution, p->storeImpulses );
+}
+
+// Hash the transform of every body that moved this step. The per body hashes are summed so the
+// result does not depend on the order the world reports the bodies in.
+static uint32_t HashStep( b3WorldId worldId, uint32_t hash )
+{
+	b3BodyEvents events = b3World_GetBodyEvents( worldId );
+	uint32_t sum = 0;
+	for ( int i = 0; i < events.moveCount; ++i )
+	{
+		const b3BodyMoveEvent* event = events.moveEvents + i;
+		uint32_t h = b3Hash( B3_HASH_INIT, (const uint8_t*)&event->bodyId.index1, sizeof( event->bodyId.index1 ) );
+		h = b3Hash( h, (const uint8_t*)&event->transform, sizeof( event->transform ) );
+		sum += h;
+	}
+
+	hash = b3Hash( hash, (const uint8_t*)&sum, sizeof( sum ) );
+	hash = b3Hash( hash, (const uint8_t*)&events.moveCount, sizeof( events.moveCount ) );
+	return hash;
+}
+
 static void MinProfile( b3Profile* p1, const b3Profile* p2 )
 {
 	p1->step = b3MinFloat( p1->step, p2->step );
@@ -226,6 +284,8 @@ int main( int argc, char** argv )
 #endif
 
 	Benchmark benchmarks[] = {
+		{ "convex_field", GetConvexFieldCapacity, CreateConvexField, DestroyConvexField, NULL, 400 },
+		{ "convex_field_hf", GetConvexFieldCapacity, CreateConvexFieldTerrain, DestroyConvexField, NULL, 400 },
 		{ "convex_pile", GetConvexPileCapacity, CreateConvexPile, NULL, NULL, 500 },
 		{ "joint_grid", NULL, CreateJointGrid, NULL, NULL, 100 },
 		{ "junkyard", GetJunkyardCapacity, CreateJunkyard, NULL, StepJunkyard, 500 },
@@ -233,6 +293,7 @@ int main( int argc, char** argv )
 		{ "large_world", GetLargeWorldCapacity, CreateLargeWorld, NULL, StepLargeWorld, 500 },
 		{ "many_pyramids", NULL, CreateManyPyramids, NULL, NULL, 100 },
 		{ "mesh_drop", NULL, CreateMeshDropBenchmark, DestroyMeshDropBenchmark, NULL, 170 },
+		{ "ragdoll_pile", GetRagdollPileCapacity, CreateRagdollPile, DestroyRagdollPile, NULL, 400 },
 		{ "rain", GetRainCapacity, CreateRain, DestroyRain, StepRain, 400 },
 		{ "sleep", GetSleepCapacity, CreateSleep, NULL, StepSleep, 300 },
 		{ "spinner", GetSpinnerCapacity, CreateSpinner, DestroySpinner, NULL, 800 },
@@ -292,6 +353,8 @@ int main( int argc, char** argv )
 	b3Counters counters = { 0 };
 	bool enableContinuous = true;
 	bool recordStepTimes = false;
+	bool printProfile = false;
+	bool printHash = false;
 	bool runSat = false;
 	bool runMesh = false;
 	const char* meshCase = NULL;
@@ -343,6 +406,14 @@ int main( int argc, char** argv )
 		{
 			recordStepTimes = true;
 		}
+		else if ( strcmp( arg, "-p" ) == 0 || strcmp( arg, "--profile" ) == 0 )
+		{
+			printProfile = true;
+		}
+		else if ( strcmp( arg, "-hash" ) == 0 || strcmp( arg, "--hash" ) == 0 )
+		{
+			printHash = true;
+		}
 		else if ( strcmp( arg, "-sat" ) == 0 || strcmp( arg, "--sat" ) == 0 )
 		{
 #ifdef BOX3D_INTERNAL_BENCHMARKS
@@ -389,6 +460,8 @@ int main( int argc, char** argv )
 					"-r, --repeats=<integer>: number of repeats (default is 4)\n"
 					"-nc, --no-continuous: disable continuous collision\n"
 					"-s, --record-steps: record step times\n"
+					"-p, --profile: print the stage timings summed over each run\n"
+					"-hash, --hash: print a hash of every body transform over the run (adds overhead)\n"
 					"-sat, --sat: compare GJK and SAT on hull pairs, then exit\n"
 					"-mesh, --mesh[=<case>]: time b3CreateMesh on several meshes, or one case, then exit\n"
 					"-simd, --simd-width=<4|8>: force the SIMD width (static Box3D only)\n"
@@ -491,9 +564,12 @@ int main( int argc, char** argv )
 				assert( stepCount <= maxSteps );
 
 				b3World_Step( worldId, timeStep, subStepCount );
-\
+
 				b3Profile profile = b3World_GetProfile( worldId );
 				MinProfile( profiles + 0, &profile );
+
+				b3Profile profileSum = { 0 };
+				uint32_t stateHash = printHash ? HashStep( worldId, B3_HASH_INIT ) : 0;
 
 				uint64_t ticks = b3GetTicks();
 
@@ -505,13 +581,29 @@ int main( int argc, char** argv )
 					}
 
 					b3World_Step( worldId, timeStep, subStepCount );
-\
+
 					profile = b3World_GetProfile( worldId );
 					MinProfile( profiles + stepIndex, &profile );
+					AddProfile( &profileSum, &profile );
+
+					if ( printHash )
+					{
+						stateHash = HashStep( worldId, stateHash );
+					}
 				}
 
 				float ms = b3GetMilliseconds( ticks );
 				printf( "run %d : %g (ms)\n", runIndex, ms );
+
+				if ( printProfile )
+				{
+					PrintProfile( &profileSum );
+				}
+
+				if ( printHash )
+				{
+					printf( "  state hash 0x%08X\n", stateHash );
+				}
 
 				if ( runIndex == 0 )
 				{

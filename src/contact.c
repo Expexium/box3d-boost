@@ -199,6 +199,14 @@ void b3CreateContact( b3World* world, b3Shape* shapeA, b3Shape* shapeB, int chil
 	b3Contact* contact = b3Array_Get( world->contacts, contactId );
 	int generation = contact->generation;
 	*contact = (b3Contact){ 0 };
+
+	// A recycled contact id must not inherit the skip record of the previous contact
+	if ( contactId < world->contactSkips.count )
+	{
+		world->contactSkips.data[contactId] = ( b3ContactSkip ){ 0 };
+		world->contactRefreshFlags.data[contactId] = 0;
+	}
+
 	contact->contactId = contactId;
 	contact->generation = generation + 1;
 	contact->setIndex = setIndex;
@@ -735,8 +743,8 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 
 // Update the contact manifold and touching status.
 // Note: do not assume the shape AABBs are overlapping or are valid.
-bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Shape* shapeA, b3Vec3 localCenterA,
-					  b3WorldTransform xfA, b3Shape* shapeB, b3Vec3 localCenterB, b3WorldTransform xfB, bool isFast,
+bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Shape* shapeA, const b3Vec3* localCenterA,
+					  b3WorldTransform xfA, b3Shape* shapeB, const b3Vec3* localCenterB, b3WorldTransform xfB, bool isFast,
 					  b3Arena arena )
 {
 	bool touching;
@@ -866,8 +874,8 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 
 	if ( touching )
 	{
-		b3Vec3 centerA = b3RotateVector( xfA.q, localCenterA );
-		b3Vec3 centerB = b3RotateVector( xfB.q, localCenterB );
+		b3Vec3 centerA = b3RotateVector( xfA.q, *localCenterA );
+		b3Vec3 centerB = b3RotateVector( xfB.q, *localCenterB );
 
 		// Adjust anchors to be relative to center of mass
 		for ( int i = 0; i < contact->manifoldCount; ++i )

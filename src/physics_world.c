@@ -14,6 +14,7 @@
 #include "hull.h"
 #include "island.h"
 #include "joint.h"
+#include "manifold.h"
 #include "parallel_for.h"
 #include "platform.h"
 #include "recording.h"
@@ -491,6 +492,12 @@ void b3DestroyWorld( b3WorldId worldId )
 	b3Array_Destroy( world->shapes );
 	b3Array_Destroy( world->fatAABBs );
 	b3Array_Destroy( world->contacts );
+	b3Array_Destroy( world->bodyEpochs );
+	b3Array_Destroy( world->bodyMotionMasks );
+	b3Array_Destroy( world->bodyQuatWindows );
+	b3Array_Destroy( world->bodyMotionRefs );
+	b3Array_Destroy( world->contactSkips );
+	b3Array_Destroy( world->contactRefreshFlags );
 	b3Array_Destroy( world->joints );
 
 	for ( int i = 0; i < world->islands.count; ++i )
@@ -556,15 +563,17 @@ int b3GetMaxWorldCount( void )
 // earlier index.
 static inline void b3PrefetchContact( const b3Contact* contact )
 {
+	// The narrow phase reads the first two cache lines of a contact
 	const char* p = (const char*)contact;
 	b3Prefetch( p );
-	b3Prefetch( p + 64 );
-	b3Prefetch( p + 128 );
-	b3Prefetch( p + 192 );
+	b3Prefetch( p + B3_CACHE_LINE_SIZE );
 }
 
+// edgeIndex: 0 for body A, 1 for body B
+// The body id is read from the contact edge here, and only when needed, because the edges are not in
+// the part of the contact the narrow phase has loaded.
 static inline b3BodySim* b3ResolveContactBodySim( b3World* world, b3BodySim* awakeSims, b3BodySim* staticSims, int encodedIndex,
-												  int bodyId )
+												  const b3Contact* contact, int edgeIndex )
 {
 	if ( encodedIndex >= 0 )
 	{
@@ -576,222 +585,1084 @@ static inline b3BodySim* b3ResolveContactBodySim( b3World* world, b3BodySim* awa
 		return staticSims - encodedIndex - 2;
 	}
 
-	b3Body* body = b3Array_Get( world->bodies, bodyId );
+	b3Body* body = b3Array_Get( world->bodies, contact->edges[edgeIndex].bodyId );
 	b3SolverSet* set = b3GetSolverSet( world, body->setIndex );
 	return b3Array_Get( set->bodySims, body->localIndex );
 }
 
+
+// Advance the motion epochs of awake bodies that left their motion windows. See b3ContactSkip.
+static void b3UpdateBodyEpochsTask( int startIndex, int endIndex, int workerIndex, void* context )
+{
+	B3_UNUSED( workerIndex );
+
+	b3World* world = context;
+	const b3BodySim* sims = b3GetSolverSet( world, b3_awakeSet )->bodySims.data;
+	uint32_t* epochs = world->bodyEpochs.data;
+	b3MotionMask* motionMasks = world->bodyMotionMasks.data;
+	float* quatWindows = world->bodyQuatWindows.data;
+	b3BodyMotionRef* refs = world->bodyMotionRefs.data;
+	const b3MotionMask allLevels = (b3MotionMask)( ( 1 << B3_SKIP_LEVEL_COUNT ) - 1 );
+	int movingCount = 0;
+
+	for ( int i = startIndex; i < endIndex; ++i )
+	{
+		const b3BodySim* sim = sims + i;
+		b3BodyMotionRef* ref = refs + i;
+
+		// Slot zero is for static bodies
+		int slot = i + 1;
+		int base = B3_SKIP_LEVEL_COUNT * slot;
+		b3MotionMask motionMask = 0;
+
+		b3Pos p = sim->transform.p;
+		b3Quat q = sim->transform.q;
+
+		// A fast body can have a time of impact applied and is never recycled, so it gets new epochs every
+		// step. A different body at this sim index means the slot must start over.
+		bool restart = ( sim->flags & b3_isFast ) != 0 || ref->bodyId != sim->bodyId;
+		ref->bodyId = sim->bodyId;
+
+		float linearWindow = B3_SKIP_LINEAR_WINDOW;
+		float quatWindow = b3GetSkipQuatWindow( sim->maxExtent );
+		quatWindows[slot] = quatWindow;
+
+		for ( int level = 0; level < B3_SKIP_LEVEL_COUNT; ++level )
+		{
+			b3BodyPoseRef* poseRef = ref->levels + level;
+			b3Vec3 dp = b3SubPos( p, poseRef->p );
+			b3Vec3 dv = b3Sub( q.v, poseRef->q.v );
+			float ds = q.s - poseRef->q.s;
+
+			// Written so a pose with NaN counts as outside the window
+			bool inside = restart == false && b3LengthSquared( dp ) <= linearWindow * linearWindow &&
+						  b3LengthSquared( dv ) + ds * ds <= quatWindow * quatWindow;
+
+			if ( inside == false )
+			{
+				// A body that left the largest window is in motion. Give the smaller windows new epochs as
+				// well without testing them. This is always allowed and keeps this loop cheap for a moving body.
+				restart = restart || level == 0;
+
+				uint32_t epoch = epochs[base + level] + 1;
+				epochs[base + level] = epoch == 0 ? 1 : epoch;
+				motionMask |= (b3MotionMask)( 1 << level );
+				poseRef->p = p;
+				poseRef->q = q;
+			}
+
+			linearWindow *= 1.0f / B3_SKIP_LEVEL_RATIO;
+			quatWindow *= 1.0f / B3_SKIP_LEVEL_RATIO;
+		}
+
+		motionMasks[slot] = motionMask;
+		movingCount += motionMask == allLevels ? 1 : 0;
+	}
+
+	b3AtomicFetchAddInt( &world->movingBodyCount, movingCount );
+}
+
+// Size the contact skip cache and update the body epochs. Must run before the narrow phase tasks.
+static void b3PrepareContactSkips( b3World* world )
+{
+	b3SolverSet* awakeSet = b3GetSolverSet( world, b3_awakeSet );
+	int awakeBodyCount = awakeSet->bodySims.count;
+
+	// One slot per awake body sim plus the static slot. Following the capacity of the body sims avoids
+	// a reallocation every step while the world is growing.
+	int slotCount = awakeBodyCount + 1;
+	int oldSlotCount = world->bodyMotionMasks.count;
+	if ( oldSlotCount < slotCount )
+	{
+		int slotCapacity = b3MaxInt( awakeSet->bodySims.capacity, awakeBodyCount ) + 1;
+		b3Array_Reserve( world->bodyEpochs, B3_SKIP_LEVEL_COUNT * slotCapacity );
+		b3Array_Reserve( world->bodyMotionMasks, slotCapacity );
+		b3Array_Reserve( world->bodyQuatWindows, slotCapacity );
+		b3Array_Reserve( world->bodyMotionRefs, slotCapacity );
+		world->bodyEpochs.count = B3_SKIP_LEVEL_COUNT * slotCount;
+		world->bodyMotionMasks.count = slotCount;
+		world->bodyQuatWindows.count = slotCount;
+		world->bodyMotionRefs.count = slotCount - 1;
+
+		for ( int i = B3_SKIP_LEVEL_COUNT * oldSlotCount; i < B3_SKIP_LEVEL_COUNT * slotCount; ++i )
+		{
+			world->bodyEpochs.data[i] = 1;
+		}
+
+		for ( int i = oldSlotCount; i < slotCount; ++i )
+		{
+			world->bodyMotionMasks.data[i] = 0;
+			world->bodyQuatWindows.data[i] = 0.0f;
+		}
+
+		// New slots track no body yet
+		for ( int i = b3MaxInt( oldSlotCount - 1, 0 ); i < slotCount - 1; ++i )
+		{
+			world->bodyMotionRefs.data[i] = ( b3BodyMotionRef ){ 0 };
+			world->bodyMotionRefs.data[i].bodyId = B3_NULL_INDEX;
+		}
+	}
+
+	// A slot that lost its body sim since the previous narrow phase ends its skip records. The body
+	// went to sleep, was disabled or destroyed, or moved to another sim index.
+	for ( int i = awakeBodyCount; i < world->skipBodyCount; ++i )
+	{
+		b3BumpSkipSlot( world, i + 1 );
+		world->bodyMotionRefs.data[i].bodyId = B3_NULL_INDEX;
+	}
+
+	world->skipBodyCount = awakeBodyCount;
+
+	int contactCount = world->contacts.count;
+	int oldContactCount = world->contactSkips.count;
+	if ( oldContactCount < contactCount )
+	{
+		b3Array_Reserve( world->contactSkips, world->contacts.capacity );
+		b3Array_Reserve( world->contactRefreshFlags, world->contacts.capacity );
+		world->contactSkips.count = contactCount;
+		world->contactRefreshFlags.count = contactCount;
+		memset( world->contactSkips.data + oldContactCount, 0, ( contactCount - oldContactCount ) * sizeof( b3ContactSkip ) );
+		memset( world->contactRefreshFlags.data + oldContactCount, 0, ( contactCount - oldContactCount ) * sizeof( b3RefreshFlag ) );
+	}
+
+	b3AtomicStoreInt( &world->movingBodyCount, 0 );
+	world->useContactSkips = false;
+
+	if ( awakeBodyCount == 0 )
+	{
+		return;
+	}
+
+	// Not worth waking the workers for a small world
+	int minRange = 512;
+	if ( awakeBodyCount < 4 * minRange )
+	{
+		b3UpdateBodyEpochsTask( 0, awakeBodyCount, 0, world );
+	}
+	else
+	{
+		b3ParallelFor( world, b3UpdateBodyEpochsTask, awakeBodyCount, minRange, world, "body epochs" );
+	}
+
+	// A skip record can only be valid if both bodies kept at least one epoch. Reading a skip record costs
+	// about a tenth of what a skipped contact saves, so only look them up when enough pairs of bodies can
+	// qualify. This keeps the narrow phase from paying for the cache while a pile is still forming.
+	float calmFraction = 1.0f - (float)b3AtomicLoadInt( &world->movingBodyCount ) / (float)awakeBodyCount;
+	world->useContactSkips = calmFraction * calmFraction > 0.1f;
+}
+
+// Number of contacts gathered before running the narrow phase on them. Gathering first keeps the skip
+// check a tight loop and lets the contact prefetch look ahead only at contacts that need work.
+#define B3_COLLIDE_BATCH_SIZE 64
+
+// The levels at which a skip record could be stored for a contact, as a mask. A body that left a window
+// on this step is in motion and will likely leave it again on the next step, so a record for that window
+// would be wasted. While a pile is forming this rejects nearly every contact, so it must stay cheap and
+// come before any other work on a skip record.
+static inline uint32_t b3GetSkipLevels( const b3MotionMask* motionMasks, int encodedA, int encodedB )
+{
+	// A body that is not awake and not static has no motion window
+	if ( encodedA == B3_NULL_INDEX || encodedB == B3_NULL_INDEX )
+	{
+		return 0;
+	}
+
+	// The slot of an awake body follows its sim index. Static bodies share a slot with a mask of zero.
+	int slotA = b3IsStaticSimIndex( encodedA ) ? B3_SKIP_STATIC_SLOT : encodedA + 1;
+	int slotB = b3IsStaticSimIndex( encodedB ) ? B3_SKIP_STATIC_SLOT : encodedB + 1;
+	uint32_t motionMask = (uint32_t)motionMasks[slotA] | (uint32_t)motionMasks[slotB];
+	const uint32_t allLevels = ( 1u << B3_SKIP_LEVEL_COUNT ) - 1u;
+	return ~motionMask & allLevels;
+}
+
+// Store a skip record if this contact will keep passing the recycling test for as long as both body
+// epochs hold. See b3ContactSkip.
+// levels: the result of b3GetSkipLevels, must not be zero
+// slack: room left in the recycling test, as a distance
+// angularDistance: the squared quaternion alignment used by the recycling test
+// relativeOffset: origin of body B relative to the origin of body A
+// maxExtent: the body extent used by the recycling test
+// tolerance: the recycling tolerance the next test will use, which depends on the contact touching
+// manifoldBucket: the manifold statistics bucket of a touching contact, zero if not touching
+static void b3StoreContactSkip( b3World* world, const b3Contact* contact, uint32_t levels, float slack, float angularDistance,
+								b3Vec3 relativeOffset, b3Vec3 maxExtent, float tolerance, int manifoldBucket )
+{
+	int encodedA = contact->encodedBodySimA;
+	int encodedB = contact->encodedBodySimB;
+	bool staticA = b3IsStaticSimIndex( encodedA );
+	bool staticB = b3IsStaticSimIndex( encodedB );
+	int slotA = staticA ? B3_SKIP_STATIC_SLOT : encodedA + 1;
+	int slotB = staticB ? B3_SKIP_STATIC_SLOT : encodedB + 1;
+
+	// Static bodies don't move while their epoch holds. Their slot has a rotation window of zero.
+	float linearA = staticA ? 0.0f : B3_SKIP_LINEAR_WINDOW;
+	float linearB = staticB ? 0.0f : B3_SKIP_LINEAR_WINDOW;
+	float quatA = world->bodyQuatWindows.data[slotA];
+	float quatB = world->bodyQuatWindows.data[slotB];
+
+	// A body can be up to two windows away from where it is now and still have the same epoch.
+	// This bounds how much the recycling measure (distance + arc) can grow in that case:
+	// - both origins translating
+	// - body A rotating, which swings the relative position of body B
+	// - both bodies rotating, which changes the relative rotation and so the arc
+	// This is for the largest window and scales down with the window size.
+	float offset = b3Length( relativeOffset );
+	float extent = b3Length( maxExtent );
+	float growth = 2.0f * ( linearA + linearB ) + 4.0f * quatA * offset + 8.0f * ( quatA + quatB ) * extent;
+
+	// The alignment test must also survive two windows of rotation
+	float alignmentGrowth = 4.1f * b3MaxFloat( quatA, quatB );
+
+	// Room for round-off, far larger than the error of the recycling test itself
+	float margin = 0.002f * tolerance + 1.0e-5f * ( offset + extent );
+	float alignmentMargin = 1.0e-5f;
+
+	// Use the largest window this contact has room for
+	float scale = 1.0f;
+	for ( int level = 0; level < B3_SKIP_LEVEL_COUNT; ++level )
+	{
+		// The growth is padded for rotations that are not perfectly normalized
+		bool haveRoom = slack > 1.1f * scale * growth + margin;
+		bool aligned = angularDistance > B3_CONTACT_RECYCLE_ANGULAR_DISTANCE + scale * alignmentGrowth + alignmentMargin;
+
+		if ( haveRoom && aligned )
+		{
+			// A smaller window would not help because the body would leave it even sooner
+			if ( ( levels & ( 1u << level ) ) == 0 )
+			{
+				return;
+			}
+
+			int epochIndexA = B3_SKIP_LEVEL_COUNT * slotA + level;
+			int epochIndexB = B3_SKIP_LEVEL_COUNT * slotB + level;
+			const uint32_t* epochs = world->bodyEpochs.data;
+			B3_ASSERT( epochIndexA <= B3_SKIP_INDEX_MASK && epochIndexB <= B3_SKIP_INDEX_MASK );
+			b3ContactSkip* skip = world->contactSkips.data + contact->contactId;
+			skip->epochIndexA = epochIndexA | ( manifoldBucket << B3_SKIP_BUCKET_SHIFT );
+			skip->epochIndexB = epochIndexB;
+			skip->epochA = epochs[epochIndexA];
+			skip->epochB = epochs[epochIndexB];
+			return;
+		}
+
+		scale *= 1.0f / B3_SKIP_LEVEL_RATIO;
+	}
+}
+
+void b3GetContactBodySims( b3World* world, const b3Contact* contact, const b3BodySim** bodySimA, const b3BodySim** bodySimB )
+{
+	b3BodySim* awakeSims = b3GetSolverSet( world, b3_awakeSet )->bodySims.data;
+	b3BodySim* staticSims = b3GetSolverSet( world, b3_staticSet )->bodySims.data;
+	*bodySimA = b3ResolveContactBodySim( world, awakeSims, staticSims, contact->encodedBodySimA, contact, 0 );
+	*bodySimB = b3ResolveContactBodySim( world, awakeSims, staticSims, contact->encodedBodySimB, contact, 1 );
+}
+
+void b3RefreshRecycledContact( b3World* world, b3Contact* contact )
+{
+	const b3BodySim* bodySimA;
+	const b3BodySim* bodySimB;
+	b3GetContactBodySims( world, contact, &bodySimA, &bodySimB );
+
+	// The wide contact preparation has its own version of this, keep them in sync
+	b3Quat dqA = b3MulQuat( bodySimA->transform.q, b3Conjugate( contact->cachedRotationA ) );
+	b3Quat dqB = b3MulQuat( bodySimB->transform.q, b3Conjugate( contact->cachedRotationB ) );
+	b3Matrix3 matrixA = b3MakeMatrixFromQuat( dqA );
+	b3Matrix3 matrixB = b3MakeMatrixFromQuat( dqB );
+
+	// Minimize round-off
+	b3Vec3 dc = b3SubPos( bodySimB->center, bodySimA->center );
+
+	int manifoldCount = contact->manifoldCount;
+	for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = contact->manifolds + manifoldIndex;
+		b3Vec3 normal = manifold->normal;
+
+		int pointCount = manifold->pointCount;
+		for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
+		{
+			// Keep anchors but update separation, same as sub-stepping. This eliminates jitter.
+			b3ManifoldPoint* mp = manifold->points + pointIndex;
+			b3Vec3 rA = b3MulMV( matrixA, mp->anchorA );
+			b3Vec3 rB = b3MulMV( matrixB, mp->anchorB );
+			b3Vec3 dp = b3Add( dc, b3Sub( rB, rA ) );
+			mp->separation = mp->baseSeparation + b3Dot( dp, normal );
+			mp->normalVelocity = 0.0f;
+			mp->persisted = true;
+		}
+	}
+}
+
+// Issues prefetches for the data a contact points at that the recycling test needs: both bounding boxes
+// and the front of both body sims. The manifolds are left out because a recycled contact normally gets
+// its manifolds refreshed by the contact solver, not here.
+static inline void b3PrefetchContactDependents( const b3Contact* contact, const b3AABB* fatAABBs, const b3BodySim* awakeSims,
+												const b3BodySim* staticSims )
+{
+	// These may straddle a cache line. A second prefetch on the same line is nearly free.
+	const char* boxA = (const char*)( fatAABBs + contact->shapeIdA );
+	const char* boxB = (const char*)( fatAABBs + contact->shapeIdB );
+	b3Prefetch( boxA );
+	b3Prefetch( boxA + sizeof( b3AABB ) - 1 );
+	b3Prefetch( boxB );
+	b3Prefetch( boxB + sizeof( b3AABB ) - 1 );
+
+	// The transform, center, flags, and extent are in the first cache line of the body sim. Sleeping
+	// bodies are rare here and not worth the body lookup.
+	int encodedA = contact->encodedBodySimA;
+	int encodedB = contact->encodedBodySimB;
+	if ( encodedA != B3_NULL_INDEX )
+	{
+		b3Prefetch( encodedA >= 0 ? awakeSims + encodedA : staticSims - encodedA - 2 );
+	}
+
+	if ( encodedB != B3_NULL_INDEX )
+	{
+		b3Prefetch( encodedB >= 0 ? awakeSims + encodedB : staticSims - encodedB - 2 );
+	}
+}
+
+#ifdef B3_SKIP_AUDIT
+#include <stdio.h>
+#include <stdlib.h>
+
+// Debug aid for the contact skip cache. Runs the bounding box test and the recycling test that the
+// narrow phase would have run on a skipped contact and stops the program if they would not have passed.
+// Define B3_SKIP_AUDIT and run the tests and benchmarks to prove the skip cache never changes a result.
+static void b3AuditContactSkip( b3World* world, const b3Contact* contact, bool isTouching, int manifoldBucket )
+{
+	b3BodySim* awakeSims = b3GetSolverSet( world, b3_awakeSet )->bodySims.data;
+	b3BodySim* staticSims = b3GetSolverSet( world, b3_staticSet )->bodySims.data;
+	const b3AABB* fatAABBs = world->fatAABBs.data;
+	const char* failure = NULL;
+
+	int encodedA = contact->encodedBodySimA;
+	int encodedB = contact->encodedBodySimB;
+	const b3BodySim* bodySimA = b3ResolveContactBodySim( world, awakeSims, staticSims, encodedA, contact, 0 );
+	const b3BodySim* bodySimB = b3ResolveContactBodySim( world, awakeSims, staticSims, encodedB, contact, 1 );
+
+	bool wasTouching = ( contact->flags & b3_simTouchingFlag );
+	bool isFast = ( ( bodySimA->flags | bodySimB->flags ) & b3_isFast ) != 0;
+	float recycleDistance = world->contactRecycleDistance;
+	float recycleTolerance = wasTouching ? recycleDistance : b3MinFloat( recycleDistance, B3_SPECULATIVE_DISTANCE );
+
+	if ( b3OverlapV( fatAABBs + contact->shapeIdA, fatAABBs + contact->shapeIdB ) == false )
+	{
+		failure = "bounding boxes are disjoint";
+	}
+	else if ( wasTouching != isTouching || ( contact->manifoldCount > 0 ) != isTouching )
+	{
+		failure = "touching state changed";
+	}
+	else if ( b3MinInt( contact->manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 ) != manifoldBucket )
+	{
+		failure = "manifold count changed";
+	}
+	else if ( isFast || recycleDistance <= 0.0f || ( contact->flags & b3_relativeTransformValid ) == 0 ||
+			  ( contact->flags & b3_contactRecycleFlag ) == 0 )
+	{
+		failure = "recycling is not allowed";
+	}
+	else
+	{
+		b3WorldTransform transformA = bodySimA->transform;
+		b3WorldTransform transformB = bodySimB->transform;
+		float angleA = b3DotQuat( transformA.q, contact->cachedRotationA );
+		float angleB = b3DotQuat( transformB.q, contact->cachedRotationB );
+		float angularDistance = b3MinFloat( angleA * angleA, angleB * angleB );
+		b3Transform xf = b3InvMulWorldTransforms( transformA, transformB );
+		b3Transform xfc = contact->cachedRelativePose;
+		b3Vec3 maxExtentA = b3IsStaticSimIndex( encodedA ) ? b3Vec3_zero : bodySimA->maxExtent;
+		b3Vec3 maxExtentB = b3IsStaticSimIndex( encodedB ) ? b3Vec3_zero : bodySimB->maxExtent;
+		b3Vec3 maxExtent = b3Max( maxExtentA, maxExtentB );
+		float distSquared = b3DistanceSquared( xf.p, xfc.p );
+
+		if ( ( angularDistance > B3_CONTACT_RECYCLE_ANGULAR_DISTANCE && distSquared < recycleTolerance * recycleTolerance ) == false )
+		{
+			failure = "moved too far";
+		}
+		else
+		{
+			float slack = recycleTolerance - sqrtf( distSquared );
+			b3Quat qr = b3InvMulQuat( xfc.q, xf.q );
+			b3Vec3 arc = b3ModifiedCross( b3Abs( qr.v ), maxExtent );
+			if ( ( 4.0f * b3LengthSquared( arc ) < slack * slack ) == false )
+			{
+				failure = "rotated too far";
+			}
+		}
+	}
+
+	if ( failure != NULL )
+	{
+		printf( "contact skip audit failed: contact %d, %s\n", contact->contactId, failure );
+		abort();
+	}
+}
+#endif
+
+// Scratch data of the narrow phase for one contact of a batch
+typedef struct b3CollideItem
+{
+	b3Contact* contact;
+	b3BodySim* bodySimA;
+	b3BodySim* bodySimB;
+	bool wasTouching;
+	bool isFast;
+} b3CollideItem;
+
+static inline int b3TestContactRecycling( int simdWidth, const b3RecycleLanes* lanes, b3RecycleResults* results )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( simdWidth == 8 )
+	{
+		return b3TestContactRecyclingW8( lanes, results );
+	}
+#endif
+
+	B3_UNUSED( simdWidth );
+	return b3TestContactRecyclingW4( lanes, results );
+}
+
+static inline int b3TestCapsuleSeparation( int simdWidth, const b3CapsuleLanes* lanes )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( simdWidth == 8 )
+	{
+		return b3TestCapsuleSeparationW8( lanes );
+	}
+#endif
+
+	B3_UNUSED( simdWidth );
+	return b3TestCapsuleSeparationW4( lanes );
+}
+
+// The extent the recycling test uses for a contact: the larger extent of the two bodies, where a
+// static body has no extent.
+static inline b3Vec3 b3GetContactMaxExtent( const b3Contact* contact, const b3BodySim* bodySimA, const b3BodySim* bodySimB )
+{
+	b3Vec3 maxExtentA = b3IsStaticSimIndex( contact->encodedBodySimA ) ? b3Vec3_zero : bodySimA->maxExtent;
+	b3Vec3 maxExtentB = b3IsStaticSimIndex( contact->encodedBodySimB ) ? b3Vec3_zero : bodySimB->maxExtent;
+	return b3Max( maxExtentA, maxExtentB );
+}
+
+// Issues prefetches for what a manifold update reads beyond the shapes and what the recycling test
+// already loaded: the collision cache of the contact, and for a touching contact its manifolds, the
+// shape materials, and the part of the body sims with the local center.
+static inline void b3PrefetchContactUpdate( const b3Contact* contact, const b3Shape* shapes, const b3BodySim* bodySimA,
+											const b3BodySim* bodySimB )
+{
+	b3Prefetch( &contact->convexContact );
+
+	if ( contact->manifoldCount > 0 )
+	{
+		const char* manifold = (const char*)contact->manifolds;
+		for ( int offset = 0; offset < (int)sizeof( b3Manifold ); offset += B3_CACHE_LINE_SIZE )
+		{
+			b3Prefetch( manifold + offset );
+		}
+
+		// A touching contact also reads the materials in the second cache line of the shapes
+		b3Prefetch( (const char*)( shapes + contact->shapeIdA ) + B3_CACHE_LINE_SIZE );
+		b3Prefetch( (const char*)( shapes + contact->shapeIdB ) + B3_CACHE_LINE_SIZE );
+		b3Prefetch( &bodySimA->localCenter );
+		b3Prefetch( &bodySimB->localCenter );
+	}
+}
+
+// Everything the narrow phase does to a contact after its manifolds were updated: statistics, touching
+// state changes, and the caches for contact recycling.
+// touching: the contact has manifold points now
+static inline void b3FinishContactUpdate( b3World* world, b3TaskContext* taskContext, const b3CollideItem* item, bool touching )
+{
+	b3Contact* contact = item->contact;
+	int contactIndex = contact->contactId;
+	bool wasTouching = item->wasTouching;
+
+	int bucketIndex = b3MinInt( contact->manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 );
+	if ( bucketIndex > 0 )
+	{
+		taskContext->manifoldCounts[bucketIndex - 1] += 1;
+	}
+
+	// Update the mesh contact spec
+	if ( touching == true && wasTouching == true && ( contact->flags & b3_simMeshContact ) )
+	{
+		B3_ASSERT( contact->colorIndex != B3_NULL_INDEX );
+		B3_ASSERT( 0 <= contact->colorIndex && contact->colorIndex < B3_GRAPH_COLOR_COUNT );
+		b3GraphColor* color = world->constraintGraph.colors + contact->colorIndex;
+		b3ContactSpec* spec = b3Array_Get( color->contacts, contact->localIndex );
+		spec->manifoldCount = (uint16_t)contact->manifoldCount;
+	}
+
+	// State changes that affect island connectivity. Also affects contact events.
+	if ( touching == true && wasTouching == false )
+	{
+		contact->flags |= b3_simStartedTouching;
+		b3SetBit( &taskContext->contactStateBitSet, contactIndex );
+	}
+	else if ( touching == false && wasTouching == true )
+	{
+		contact->flags |= b3_simStoppedTouching;
+		b3SetBit( &taskContext->contactStateBitSet, contactIndex );
+	}
+
+	if ( touching )
+	{
+		int manifoldCount = contact->manifoldCount;
+		for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
+		{
+			b3Manifold* manifold = contact->manifolds + manifoldIndex;
+			int pointCount = manifold->pointCount;
+			for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
+			{
+				// Cache separation
+				b3ManifoldPoint* mp = manifold->points + pointIndex;
+				mp->baseSeparation = mp->separation;
+			}
+		}
+	}
+
+	// The recycling cache was just refreshed, so the next recycling test starts with the full
+	// tolerance. Try to skip this contact on later steps.
+	float recycleDistance = world->contactRecycleDistance;
+	uint32_t skipLevels = b3GetSkipLevels( world->bodyMotionMasks.data, contact->encodedBodySimA, contact->encodedBodySimB );
+	if ( skipLevels != 0 && ( contact->manifoldCount > 0 ) == touching && recycleDistance > 0.0f &&
+		 ( contact->flags & b3_relativeTransformValid ) && ( contact->flags & b3_contactRecycleFlag ) )
+	{
+		b3Vec3 maxExtent = b3GetContactMaxExtent( contact, item->bodySimA, item->bodySimB );
+		float nextTolerance = touching ? recycleDistance : b3MinFloat( recycleDistance, B3_SPECULATIVE_DISTANCE );
+		b3StoreContactSkip( world, contact, skipLevels, nextTolerance, 1.0f, contact->cachedRelativePose.p, maxExtent, nextTolerance,
+							bucketIndex );
+	}
+}
+
+// Finish a contact whose shapes turned out to be too far apart to have contact points. This is what
+// b3UpdateContact does with that result.
+static inline void b3FinishSeparatedContact( b3World* world, b3TaskContext* taskContext, const b3CollideItem* item )
+{
+	b3Contact* contact = item->contact;
+	if ( contact->manifoldCount > 0 )
+	{
+		b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
+		contact->manifolds = NULL;
+		contact->manifoldCount = 0;
+	}
+
+	contact->flags &= ~b3_simTouchingFlag;
+
+	b3FinishContactUpdate( world, taskContext, item, false );
+}
+
+// Compute the manifolds of a contact with the scalar collision functions. The recycling cache of the
+// contact must already hold the current body poses.
+static inline void b3UpdateContactManifolds( b3World* world, int workerIndex, b3TaskContext* taskContext, const b3CollideItem* item )
+{
+	b3Contact* contact = item->contact;
+	b3Shape* shapeA = world->shapes.data + contact->shapeIdA;
+	b3Shape* shapeB = world->shapes.data + contact->shapeIdB;
+	b3BodySim* bodySimA = item->bodySimA;
+	b3BodySim* bodySimB = item->bodySimB;
+
+	// This updates solid contacts
+	bool touching = b3UpdateContact( world, workerIndex, contact, shapeA, &bodySimA->localCenter, bodySimA->transform, shapeB,
+									 &bodySimB->localCenter, bodySimB->transform, item->isFast, taskContext->arena );
+
+	b3FinishContactUpdate( world, taskContext, item, touching );
+}
+
+#ifdef B3_SKIP_AUDIT
+// Debug aid for the wide recycling test. Runs the scalar test and stops the program if the wide test
+// did not compute exactly the same thing.
+static void b3AuditWideRecycling( const b3CollideItem* item, float recycleTolerance, const b3RecycleResults* results, int lane,
+								  bool recycled )
+{
+	const b3Contact* contact = item->contact;
+	b3WorldTransform transformA = item->bodySimA->transform;
+	b3WorldTransform transformB = item->bodySimB->transform;
+	float angleA = b3DotQuat( transformA.q, contact->cachedRotationA );
+	float angleB = b3DotQuat( transformB.q, contact->cachedRotationB );
+	float angularDistance = b3MinFloat( angleA * angleA, angleB * angleB );
+	b3Transform xf = b3InvMulWorldTransforms( transformA, transformB );
+	b3Transform xfc = contact->cachedRelativePose;
+	b3Vec3 maxExtent = b3GetContactMaxExtent( contact, item->bodySimA, item->bodySimB );
+	float distSquared = b3DistanceSquared( xf.p, xfc.p );
+	bool scalarRecycled = false;
+	float slack = 0.0f, arcSq = 0.0f;
+
+	if ( angularDistance > B3_CONTACT_RECYCLE_ANGULAR_DISTANCE && distSquared < recycleTolerance * recycleTolerance )
+	{
+		slack = recycleTolerance - sqrtf( distSquared );
+		b3Quat qr = b3InvMulQuat( xfc.q, xf.q );
+		b3Vec3 arc = b3ModifiedCross( b3Abs( qr.v ), maxExtent );
+		arcSq = 4.0f * b3LengthSquared( arc );
+		scalarRecycled = arcSq < slack * slack;
+	}
+
+	b3Transform wide = { { results->px[lane], results->py[lane], results->pz[lane] },
+						 { { results->qx[lane], results->qy[lane], results->qz[lane] }, results->qs[lane] } };
+
+	bool same = scalarRecycled == recycled && memcmp( &wide, &xf, sizeof( b3Transform ) ) == 0 &&
+				memcmp( &angularDistance, results->angularDistance + lane, sizeof( float ) ) == 0;
+
+	if ( scalarRecycled )
+	{
+		same = same && memcmp( &slack, results->slack + lane, sizeof( float ) ) == 0 &&
+			   memcmp( &arcSq, results->arcSquared + lane, sizeof( float ) ) == 0;
+	}
+
+	if ( same == false )
+	{
+		printf( "wide recycling audit failed: contact %d, scalar %d wide %d\n", contact->contactId, scalarRecycled, recycled );
+		abort();
+	}
+}
+
+// Debug aid for the cached axis shortcut of hull pairs. Runs the hull collision function on a copy of
+// the cache and stops the program if it does not report a separated cache hit.
+static void b3AuditCachedAxisSeparation( b3World* world, const b3Contact* contact, const b3Shape* shapeA, const b3Shape* shapeB )
+{
+	b3SATCache cache = contact->convexContact.cache.satCache;
+	b3SATCache before = cache;
+	before.hit = 1;
+
+	b3LocalManifoldPoint points[B3_MAX_MANIFOLD_POINTS];
+	b3LocalManifold manifold = { 0 };
+	manifold.points = points;
+	b3CollideHullsAtWidth( &manifold, B3_MAX_MANIFOLD_POINTS, shapeA->hull, shapeB->hull, contact->cachedRelativePose, &cache,
+						   world->simdWidth );
+
+	if ( manifold.pointCount != 0 || memcmp( &cache, &before, sizeof( b3SATCache ) ) != 0 )
+	{
+		printf( "cached axis audit failed: contact %d, points %d, hit %d\n", contact->contactId, manifold.pointCount, cache.hit );
+		abort();
+	}
+}
+
+// Debug aid for the wide capsule separation test, same idea
+static void b3AuditWideCapsuleSeparation( const b3Contact* contact, const b3Shape* shapeA, const b3Shape* shapeB, bool separated )
+{
+	b3Transform transformBtoA = contact->cachedRelativePose;
+	b3Vec3 centerB1 = b3TransformPoint( transformBtoA, shapeB->capsule.center1 );
+	b3Vec3 centerB2 = b3TransformPoint( transformBtoA, shapeB->capsule.center2 );
+	float radius = shapeA->capsule.radius + shapeB->capsule.radius;
+	float maxDistance = radius + B3_SPECULATIVE_DISTANCE;
+	b3SegmentDistanceResult result = b3SegmentDistance( shapeA->capsule.center1, shapeA->capsule.center2, centerB1, centerB2 );
+	float distanceSquared = b3LengthSquared( b3Sub( result.point2, result.point1 ) );
+	float minDistance = 0.01f * B3_LINEAR_SLOP;
+	bool scalarSeparated = distanceSquared > maxDistance * maxDistance || distanceSquared < minDistance * minDistance;
+
+	b3LocalManifoldPoint points[B3_MAX_MANIFOLD_POINTS];
+	b3LocalManifold manifold = { 0 };
+	manifold.points = points;
+	b3CollideCapsules( &manifold, B3_MAX_MANIFOLD_POINTS, &shapeA->capsule, &shapeB->capsule, transformBtoA );
+
+	if ( scalarSeparated != separated || ( separated && manifold.pointCount != 0 ) )
+	{
+		printf( "wide capsule audit failed: contact %d, scalar %d wide %d points %d\n", contact->contactId, scalarSeparated, separated,
+				manifold.pointCount );
+		abort();
+	}
+}
+#endif
+
+// The narrow phase runs on small batches of contacts in passes
+// 1. gather the contacts that need work, leaving out the contacts that have a valid skip record
+// 2. test bounding boxes and sort the contacts into those that may be recycled and those that need new manifolds
+// 3. run the recycling test on several contacts at once
+// 4. update the manifolds of the contacts that could not be recycled. Capsule pairs first go through the
+//    separation test on several pairs at once, which finishes most of them while a pile is in motion.
+// Working in passes keeps each loop small and lets the prefetches look ahead only at contacts that need
+// work. A contact pulls in data scattered across several arrays, so knowing a few contacts ahead what
+// will be needed lets the cache misses overlap instead of stalling one at a time. A batch is small
+// enough to stay in the first level cache between the passes.
+// Contacts are independent so the order they are processed in does not affect the result.
 static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* context )
 {
 	b3TracyCZoneNC( collide_task, "Collide Task", b3_colorDodgerBlue, true );
 
 	b3StepContext* stepContext = (b3StepContext*)context;
 	b3World* world = stepContext->world;
-	b3ConstraintGraph* graph = &world->constraintGraph;
 	b3TaskContext* taskContext = world->taskContexts.data + workerIndex;
 	int* contactIndices = stepContext->awakeContactIndices;
+	int touchingCount = stepContext->touchingContactCount;
 	b3Contact* contacts = world->contacts.data;
 	b3Shape* shapes = world->shapes.data;
 	const b3AABB* fatAABBs = world->fatAABBs.data;
 	b3BodySim* awakeSims = b3GetSolverSet( world, b3_awakeSet )->bodySims.data;
 	b3BodySim* staticSims = b3GetSolverSet( world, b3_staticSet )->bodySims.data;
+	const b3ContactSkip* skips = world->contactSkips.data;
+	const uint32_t* bodyEpochs = world->bodyEpochs.data;
+	const b3MotionMask* motionMasks = world->bodyMotionMasks.data;
+	b3RefreshFlag* refreshFlags = world->contactRefreshFlags.data;
 
 	B3_ASSERT( startIndex < endIndex );
+
+	// The contact solver runs after this and can refresh the manifolds of recycled contacts when it
+	// prepares them. It loads the manifolds anyway, so this saves loading them here as well.
+	bool deferRefresh = stepContext->deferContactRefresh;
+
+	// Contacts from this index on are looked up in the skip cache. Touching contacts come first and can
+	// only be skipped when the contact solver refreshes their manifolds.
+	int skipStartIndex = endIndex;
+	if ( world->useContactSkips )
+	{
+		skipStartIndex = deferRefresh ? 0 : touchingCount;
+	}
 
 	float recycleDistance = world->contactRecycleDistance;
 	float speculativeDistance = B3_SPECULATIVE_DISTANCE;
 	float recycleDistanceNonTouching = b3MinFloat( recycleDistance, speculativeDistance );
 
-	const int contactPrefetchDistance = 4;
-	int prefetchEnd = endIndex - contactPrefetchDistance;
+	// Number of contacts the wide tests take at once
+	int simdWidth = world->simdWidth;
+	int laneCount = simdWidth == 8 ? 8 : 4;
 
-	for ( int i = startIndex; i < endIndex; ++i )
+	const int skipPrefetchDistance = 16;
+	int skipPrefetchEnd = endIndex - skipPrefetchDistance;
+
+	// Contacts that need work
+	int batch[B3_COLLIDE_BATCH_SIZE];
+	b3CollideItem items[B3_COLLIDE_BATCH_SIZE];
+
+	// Indices into the items
+	int recycleList[B3_COLLIDE_BATCH_SIZE];
+	int updateList[B3_COLLIDE_BATCH_SIZE];
+	int capsuleList[B3_COLLIDE_BATCH_SIZE];
+
+	int skippedCount = 0;
+	int index = startIndex;
+
+	while ( index < endIndex )
 	{
-		if ( i < prefetchEnd )
+		int batchCount = 0;
+
+		// These contacts always need work
+		while ( index < skipStartIndex && index < endIndex && batchCount < B3_COLLIDE_BATCH_SIZE )
 		{
-			b3PrefetchContact( contacts + contactIndices[i + contactPrefetchDistance] );
+			int contactIndex = contactIndices[index];
+			b3PrefetchContact( contacts + contactIndex );
+			batch[batchCount] = contactIndex;
+			batchCount += 1;
+			index += 1;
 		}
 
-		int contactIndex = contactIndices[i];
-		B3_ASSERT( contactIndex < world->contacts.count );
-
-		b3Contact* contact = contacts + contactIndex;
-		B3_VALIDATE( contact->contactId == contactIndex );
-
-		int shapeIdA = contact->shapeIdA;
-		int shapeIdB = contact->shapeIdB;
-
-		// Do proxies still overlap?
-		bool overlap = b3OverlapV( fatAABBs + shapeIdA, fatAABBs + shapeIdB );
-		if ( overlap == false )
+		// A contact is skipped while both bodies remain in the motion epochs stored in its skip record.
+		// This is the common case in a pile and avoids loading the contact, shapes, and bodies.
+		while ( index < endIndex && batchCount < B3_COLLIDE_BATCH_SIZE )
 		{
-			// This contact will be destroyed
-			contact->flags |= b3_simDisjoint;
-			contact->flags &= ~b3_simTouchingFlag;
-			b3SetBit( &taskContext->contactStateBitSet, contactIndex );
-			continue;
-		}
-
-		b3Shape* shapeA = shapes + shapeIdA;
-		b3Shape* shapeB = shapes + shapeIdB;
-
-		// Update contact respecting shape/body order (A,B)
-		int encodedA = contact->encodedBodySimA;
-		int encodedB = contact->encodedBodySimB;
-		b3BodySim* bodySimA = b3ResolveContactBodySim( world, awakeSims, staticSims, encodedA, contact->edges[0].bodyId );
-		b3BodySim* bodySimB = b3ResolveContactBodySim( world, awakeSims, staticSims, encodedB, contact->edges[1].bodyId );
-
-		bool wasTouching = ( contact->flags & b3_simTouchingFlag );
-
-		b3WorldTransform transformA = bodySimA->transform;
-		b3WorldTransform transformB = bodySimB->transform;
-
-		// This is really just needed for mesh collision to prevent tunneling.
-		bool isFast = ( ( bodySimA->flags | bodySimB->flags ) & b3_isFast ) != 0;
-
-		float recycleTolerance = wasTouching ? recycleDistance : recycleDistanceNonTouching;
-
-		// Contact recycling optimization. Please cite this library if you use this optimization.
-		// This is inspired by persistent contact manifolds used in some physics engines, such as PhysX.
-		// However, this allows larger relative motion and has fewer tuning parameters (just one).
-		if ( isFast == false && recycleDistance > 0.0f && ( contact->flags & b3_relativeTransformValid ) &&
-			 ( contact->flags & b3_contactRecycleFlag ) )
-		{
-			// The scalar part of b3InvMulQuat is just the quaternion dot product.
-			// cos(relative_angle/2) = scalar(conj(q1) * q2) = dot(q1, q2)
-			// A small relative angle means this value is close to 1. Need to use abs or square
-			// due to double cover.
-			float angleA = b3DotQuat( transformA.q, contact->cachedRotationA );
-			float angleB = b3DotQuat( transformB.q, contact->cachedRotationB );
-			float angularDistance = b3MinFloat( angleA * angleA, angleB * angleB );
-
-			b3Transform xf = b3InvMulWorldTransforms( transformA, transformB );
-			b3Transform xfc = contact->cachedRelativePose;
-			b3Vec3 maxExtentA = b3IsStaticSimIndex( encodedA ) ? b3Vec3_zero : bodySimA->maxExtent;
-			b3Vec3 maxExtentB = b3IsStaticSimIndex( encodedB ) ? b3Vec3_zero : bodySimB->maxExtent;
-			b3Vec3 maxExtent = b3Max( maxExtentA, maxExtentB );
-
-			// Variation of Conservative Advancement
-			// distance + 2 * length(modified_cross(|qr.v|, maxExtent)) < recycleTolerance.
-			// 2*|qr.v| == 2*|sin(theta/2)| ~= theta for small angles.
-			float distSquared = b3DistanceSquared( xf.p, xfc.p );
-
-			if ( angularDistance > B3_CONTACT_RECYCLE_ANGULAR_DISTANCE && distSquared < recycleTolerance * recycleTolerance )
+			if ( index < skipPrefetchEnd )
 			{
-				float distance = sqrtf( distSquared );
-				float slack = recycleTolerance - distance;
+				b3Prefetch( skips + contactIndices[index + skipPrefetchDistance] );
+			}
 
-				// qr = inv( inv(qA0) * qB0 ) * inv(qA) * qB
-				//    = inv(qB0) * qA0 * inv(qA) * qB
-				// Suppose A is static
-				// qr = inv(qB0) * qA0 * inv(qA0) * qB
-				//    = inv(qB0) * qB
-				// qB = qB0 * qr
-				// Therefore qr is associated with the local angular velocity of body B when A is static.
-				b3Quat qr = b3InvMulQuat( xfc.q, xf.q );
-				b3Vec3 arc = b3ModifiedCross( b3Abs( qr.v ), maxExtent );
+			int contactIndex = contactIndices[index];
+			bool isTouching = index < touchingCount;
+			index += 1;
 
-				float arcSq = 4.0f * b3LengthSquared( arc );
-				if ( arcSq < slack * slack )
+			b3ContactSkip skip = skips[contactIndex];
+			int manifoldBucket = (int)( (uint32_t)skip.epochIndexA >> B3_SKIP_BUCKET_SHIFT );
+
+			// The record of a touching contact always has a bucket and the record of a contact that is not
+			// touching never does. Requiring that here guards against a record that outlived a state change.
+			if ( skip.epochA == bodyEpochs[skip.epochIndexA & B3_SKIP_INDEX_MASK] && skip.epochB == bodyEpochs[skip.epochIndexB] &&
+				 ( manifoldBucket > 0 ) == isTouching )
+			{
+#ifdef B3_SKIP_AUDIT
+				b3AuditContactSkip( world, contacts + contactIndex, isTouching, manifoldBucket );
+#endif
+				skippedCount += 1;
+
+				if ( isTouching )
 				{
-					b3Quat dqA = b3MulQuat( transformA.q, b3Conjugate( contact->cachedRotationA ) );
-					b3Quat dqB = b3MulQuat( transformB.q, b3Conjugate( contact->cachedRotationB ) );
-					b3Matrix3 matrixA = b3MakeMatrixFromQuat( dqA );
-					b3Matrix3 matrixB = b3MakeMatrixFromQuat( dqB );
+					// The contact solver refreshes the manifolds when it prepares this contact
+					refreshFlags[contactIndex] = 1;
+					taskContext->manifoldCounts[manifoldBucket - 1] += 1;
+				}
 
-					// Minimize round-off
-					b3Vec3 dc = b3SubPos( bodySimB->center, bodySimA->center );
+				continue;
+			}
 
-					int manifoldCount = contact->manifoldCount;
-					for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
+			b3PrefetchContact( contacts + contactIndex );
+			batch[batchCount] = contactIndex;
+			batchCount += 1;
+		}
+
+		// The contacts of this batch are on their way into the cache. Now ask for the bounding boxes
+		// and bodies they point at. This loop does nothing else, so the processor can run it far
+		// ahead and overlap these cache misses with the ones on the contacts themselves.
+		for ( int i = 0; i < batchCount; ++i )
+		{
+			b3PrefetchContactDependents( contacts + batch[i], fatAABBs, awakeSims, staticSims );
+		}
+
+		int recycleCount = 0;
+		int updateCount = 0;
+
+		// Sort the contacts by what needs to be done with them
+		for ( int i = 0; i < batchCount; ++i )
+		{
+			int contactIndex = batch[i];
+			B3_ASSERT( contactIndex < world->contacts.count );
+
+			b3Contact* contact = contacts + contactIndex;
+			B3_VALIDATE( contact->contactId == contactIndex );
+
+			// This contact is handled here, so there is nothing left over for the contact solver to refresh
+			refreshFlags[contactIndex] = 0;
+
+			int shapeIdA = contact->shapeIdA;
+			int shapeIdB = contact->shapeIdB;
+
+			// Do proxies still overlap?
+			bool overlap = b3OverlapV( fatAABBs + shapeIdA, fatAABBs + shapeIdB );
+			if ( overlap == false )
+			{
+				// This contact will be destroyed
+				contact->flags |= b3_simDisjoint;
+				contact->flags &= ~b3_simTouchingFlag;
+				b3SetBit( &taskContext->contactStateBitSet, contactIndex );
+				continue;
+			}
+
+			// Update contact respecting shape/body order (A,B)
+			b3BodySim* bodySimA = b3ResolveContactBodySim( world, awakeSims, staticSims, contact->encodedBodySimA, contact, 0 );
+			b3BodySim* bodySimB = b3ResolveContactBodySim( world, awakeSims, staticSims, contact->encodedBodySimB, contact, 1 );
+
+			b3CollideItem* item = items + i;
+			item->contact = contact;
+			item->bodySimA = bodySimA;
+			item->bodySimB = bodySimB;
+			item->wasTouching = ( contact->flags & b3_simTouchingFlag );
+
+			// This is really just needed for mesh collision to prevent tunneling.
+			item->isFast = ( ( bodySimA->flags | bodySimB->flags ) & b3_isFast ) != 0;
+
+			// Contact recycling optimization. Please cite this library if you use this optimization.
+			// This is inspired by persistent contact manifolds used in some physics engines, such as PhysX.
+			// However, this allows larger relative motion and has fewer tuning parameters (just one).
+			if ( item->isFast == false && recycleDistance > 0.0f && ( contact->flags & b3_relativeTransformValid ) &&
+				 ( contact->flags & b3_contactRecycleFlag ) )
+			{
+				recycleList[recycleCount] = i;
+				recycleCount += 1;
+				continue;
+			}
+
+			// Caching for contact recycling.
+			b3WorldTransform transformA = bodySimA->transform;
+			b3WorldTransform transformB = bodySimB->transform;
+			contact->cachedRotationA = transformA.q;
+			contact->cachedRotationB = transformB.q;
+			contact->cachedRelativePose = b3InvMulWorldTransforms( transformA, transformB );
+			contact->flags |= b3_relativeTransformValid;
+
+			// The manifold update starts with the shapes
+			b3Prefetch( shapes + shapeIdA );
+			b3Prefetch( shapes + shapeIdB );
+
+			updateList[updateCount] = i;
+			updateCount += 1;
+		}
+
+		// Recycling test. See b3TestContactRecyclingW8 for the test itself.
+		for ( int first = 0; first < recycleCount; first += laneCount )
+		{
+			int count = b3MinInt( laneCount, recycleCount - first );
+
+			b3RecycleLanes lanes;
+			b3RecycleResults results;
+			for ( int lane = 0; lane < laneCount; ++lane )
+			{
+				// Unused lanes repeat the first contact
+				const b3CollideItem* item = items + recycleList[lane < count ? first + lane : first];
+				const b3Contact* contact = item->contact;
+				b3Vec3 maxExtent = b3GetContactMaxExtent( contact, item->bodySimA, item->bodySimB );
+
+				lanes.contacts[lane] = contact;
+				lanes.simsA[lane] = item->bodySimA;
+				lanes.simsB[lane] = item->bodySimB;
+				lanes.tolerances[lane] = item->wasTouching ? recycleDistance : recycleDistanceNonTouching;
+				lanes.extentX[lane] = maxExtent.x;
+				lanes.extentY[lane] = maxExtent.y;
+				lanes.extentZ[lane] = maxExtent.z;
+			}
+
+			int recycleMask = b3TestContactRecycling( simdWidth, &lanes, &results );
+
+			for ( int lane = 0; lane < count; ++lane )
+			{
+				int itemIndex = recycleList[first + lane];
+				const b3CollideItem* item = items + itemIndex;
+				b3Contact* contact = item->contact;
+				bool recycled = ( recycleMask & ( 1 << lane ) ) != 0;
+
+#ifdef B3_SKIP_AUDIT
+				b3AuditWideRecycling( item, lanes.tolerances[lane], &results, lane, recycled );
+#endif
+
+				// Pose of body B relative to body A
+				b3Transform xf = { { results.px[lane], results.py[lane], results.pz[lane] },
+								   { { results.qx[lane], results.qy[lane], results.qz[lane] }, results.qs[lane] } };
+
+				if ( recycled == false )
+				{
+					// Caching for contact recycling.
+					contact->cachedRotationA = item->bodySimA->transform.q;
+					contact->cachedRotationB = item->bodySimB->transform.q;
+					contact->cachedRelativePose = xf;
+
+					// The manifold update starts with the shapes
+					b3Prefetch( shapes + contact->shapeIdA );
+					b3Prefetch( shapes + contact->shapeIdB );
+
+					updateList[updateCount] = itemIndex;
+					updateCount += 1;
+					continue;
+				}
+
+				// Contact is recycled. This also skips updating other aspects of the contact
+				// such as material parameters.
+				int manifoldCount = contact->manifoldCount;
+				if ( manifoldCount > 0 )
+				{
+					// Keep anchors but update separation, same as sub-stepping. This eliminates jitter.
+					if ( deferRefresh )
 					{
-						b3Manifold* manifold = contact->manifolds + manifoldIndex;
-						b3Vec3 normal = manifold->normal;
-
-						int pointCount = manifold->pointCount;
-						for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
-						{
-							// Keep anchors but update separation, same as sub-stepping. This eliminates jitter.
-							b3ManifoldPoint* mp = manifold->points + pointIndex;
-							b3Vec3 rA = b3MulMV( matrixA, mp->anchorA );
-							b3Vec3 rB = b3MulMV( matrixB, mp->anchorB );
-							b3Vec3 dp = b3Add( dc, b3Sub( rB, rA ) );
-							mp->separation = mp->baseSeparation + b3Dot( dp, normal );
-							mp->normalVelocity = 0.0f;
-							mp->persisted = true;
-						}
+						refreshFlags[contact->contactId] = 1;
 					}
-
-					// Diagnostics
-					taskContext->recycledContactCount += 1;
-					int bucketIndex = b3MinInt( manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 );
-					if ( bucketIndex > 0 )
+					else
 					{
-						taskContext->manifoldCounts[bucketIndex - 1] += 1;
+						b3RefreshRecycledContact( world, contact );
 					}
+				}
 
-					// Contact is recycled. This also skips updating other aspects of the contact
-					// such as material parameters.
+				// Diagnostics
+				taskContext->recycledContactCount += 1;
+				int bucketIndex = b3MinInt( manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 );
+				if ( bucketIndex > 0 )
+				{
+					taskContext->manifoldCounts[bucketIndex - 1] += 1;
+				}
+
+				// Try to skip this contact on later steps
+				uint32_t skipLevels = b3GetSkipLevels( motionMasks, contact->encodedBodySimA, contact->encodedBodySimB );
+				if ( skipLevels != 0 && ( manifoldCount > 0 ) == item->wasTouching )
+				{
+					b3Vec3 maxExtent = { lanes.extentX[lane], lanes.extentY[lane], lanes.extentZ[lane] };
+					b3StoreContactSkip( world, contact, skipLevels, results.slack[lane] - sqrtf( results.arcSquared[lane] ),
+										results.angularDistance[lane], xf.p, maxExtent, lanes.tolerances[lane], bucketIndex );
+				}
+			}
+		}
+
+		// Manifold updates. Capsule pairs are set aside for the wide separation test.
+		// A manifold update is a lot of work and reads many cache lines, so the prefetches for it are
+		// issued a couple of contacts ahead. Asking for everything of the whole batch at once would be
+		// more than the processor can keep in flight.
+		const int updateLookAhead = 2;
+		for ( int i = 0; i < updateLookAhead && i < updateCount; ++i )
+		{
+			const b3CollideItem* ahead = items + updateList[i];
+			b3PrefetchContactUpdate( ahead->contact, shapes, ahead->bodySimA, ahead->bodySimB );
+		}
+
+		int capsuleCount = 0;
+		for ( int i = 0; i < updateCount; ++i )
+		{
+			if ( i + updateLookAhead < updateCount )
+			{
+				const b3CollideItem* ahead = items + updateList[i + updateLookAhead];
+				b3PrefetchContactUpdate( ahead->contact, shapes, ahead->bodySimA, ahead->bodySimB );
+			}
+
+			int itemIndex = updateList[i];
+			const b3CollideItem* item = items + itemIndex;
+			b3Contact* contact = item->contact;
+			const b3Shape* shapeA = shapes + contact->shapeIdA;
+			const b3Shape* shapeB = shapes + contact->shapeIdB;
+
+			if ( shapeA->type == b3_capsuleShape && shapeB->type == b3_capsuleShape )
+			{
+				capsuleList[capsuleCount] = itemIndex;
+				capsuleCount += 1;
+				continue;
+			}
+
+			// Two hulls that are in motion without touching usually stay separated along the axis that
+			// separated them before. Checking that axis is the first thing the hull collision function does,
+			// so do the same check here and skip the rest of the manifold update if it holds.
+			if ( shapeA->type == b3_hullShape && shapeB->type == b3_hullShape )
+			{
+				b3SATCache* cache = &contact->convexContact.cache.satCache;
+				if ( b3IsSeparatedByCachedAxis( shapeA->hull, shapeB->hull, contact->cachedRelativePose, cache ) )
+				{
+#ifdef B3_SKIP_AUDIT
+					b3AuditCachedAxisSeparation( world, contact, shapeA, shapeB );
+#endif
+					// What the hull collision function reports for this case
+					cache->hit = 1;
+					taskContext->satCallCount += 1;
+					taskContext->satCacheHitCount += 1;
+
+					b3FinishSeparatedContact( world, taskContext, item );
 					continue;
 				}
 			}
+
+			b3UpdateContactManifolds( world, workerIndex, taskContext, item );
 		}
 
-		// Caching for contact recycling.
-		contact->cachedRotationA = transformA.q;
-		contact->cachedRotationB = transformB.q;
-		contact->cachedRelativePose = b3InvMulWorldTransforms( transformA, transformB );
-		contact->flags |= b3_relativeTransformValid;
-
-		// This updates solid contacts
-		bool touching = b3UpdateContact( world, workerIndex, contact, shapeA, bodySimA->localCenter,
-										 transformA, shapeB,
-										 bodySimB->localCenter, transformB, isFast, taskContext->arena );
-
-		int bucketIndex = b3MinInt( contact->manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 );
-		if ( bucketIndex > 0 )
+		// See b3TestCapsuleSeparationW8 for the test itself
+		for ( int first = 0; first < capsuleCount; first += laneCount )
 		{
-			taskContext->manifoldCounts[bucketIndex - 1] += 1;
-		}
+			int count = b3MinInt( laneCount, capsuleCount - first );
 
-		// Update the mesh contact spec
-		if ( touching == true && wasTouching == true && ( contact->flags & b3_simMeshContact ) )
-		{
-			B3_ASSERT( contact->colorIndex != B3_NULL_INDEX );
-			B3_ASSERT( 0 <= contact->colorIndex && contact->colorIndex < B3_GRAPH_COLOR_COUNT );
-			b3GraphColor* color = graph->colors + contact->colorIndex;
-			b3ContactSpec* spec = b3Array_Get( color->contacts, contact->localIndex );
-			spec->manifoldCount = (uint16_t)contact->manifoldCount;
-		}
-
-		// State changes that affect island connectivity. Also affects contact events.
-		if ( touching == true && wasTouching == false )
-		{
-			contact->flags |= b3_simStartedTouching;
-			b3SetBit( &taskContext->contactStateBitSet, contactIndex );
-		}
-		else if ( touching == false && wasTouching == true )
-		{
-			contact->flags |= b3_simStoppedTouching;
-			b3SetBit( &taskContext->contactStateBitSet, contactIndex );
-		}
-
-		if ( touching )
-		{
-			int manifoldCount = contact->manifoldCount;
-			for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
+			b3CapsuleLanes lanes;
+			for ( int lane = 0; lane < laneCount; ++lane )
 			{
-				b3Manifold* manifold = contact->manifolds + manifoldIndex;
-				int pointCount = manifold->pointCount;
-				for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
+				// Unused lanes repeat the first contact
+				const b3Contact* contact = items[capsuleList[lane < count ? first + lane : first]].contact;
+
+				// The recycling cache already holds the pose of body B relative to body A
+				b3Transform xf = contact->cachedRelativePose;
+
+				lanes.shapesA[lane] = shapes + contact->shapeIdA;
+				lanes.shapesB[lane] = shapes + contact->shapeIdB;
+				lanes.px[lane] = xf.p.x;
+				lanes.py[lane] = xf.p.y;
+				lanes.pz[lane] = xf.p.z;
+				lanes.qx[lane] = xf.q.v.x;
+				lanes.qy[lane] = xf.q.v.y;
+				lanes.qz[lane] = xf.q.v.z;
+				lanes.qs[lane] = xf.q.s;
+			}
+
+			int separatedMask = b3TestCapsuleSeparation( simdWidth, &lanes );
+
+			for ( int lane = 0; lane < count; ++lane )
+			{
+				const b3CollideItem* item = items + capsuleList[first + lane];
+				bool separated = ( separatedMask & ( 1 << lane ) ) != 0;
+
+#ifdef B3_SKIP_AUDIT
+				b3AuditWideCapsuleSeparation( item->contact, lanes.shapesA[lane], lanes.shapesB[lane], separated );
+#endif
+
+				if ( separated == false )
 				{
-					// Cache separation
-					b3ManifoldPoint* mp = manifold->points + pointIndex;
-					mp->baseSeparation = mp->separation;
+					b3UpdateContactManifolds( world, workerIndex, taskContext, item );
+					continue;
 				}
+
+				// The capsules are too far apart to have contact points
+				b3FinishSeparatedContact( world, taskContext, item );
 			}
 		}
 	}
+
+	// A skipped contact is a recycled contact
+	taskContext->recycledContactCount += skippedCount;
 
 	b3TracyCZoneEnd( collide_task );
 }
@@ -879,6 +1750,10 @@ static void b3Collide( b3StepContext* context )
 	}
 
 	context->awakeContactIndices = contactIndices;
+	context->touchingContactCount = touchingCount;
+	context->deferContactRefresh = context->dt > 0.0f;
+
+	b3PrepareContactSkips( world );
 
 	// Contact bit set on ids because contact pointers are unstable as they move between touching and not touching.
 	int contactIdCapacity = b3GetIdCapacity( &world->contactIdPool );
@@ -935,100 +1810,182 @@ static void b3Collide( b3StepContext* context )
 	int endEventArrayIndex = world->endEventArrayIndex;
 
 	const b3Shape* shapes = world->shapes.data;
+	const b3Body* bodies = world->bodies.data;
+	b3Contact* contacts = world->contacts.data;
 	uint16_t worldId = world->worldId;
 
-	// Process contact state changes. Iterate over set bits
+	// Gather the contacts that changed state, in the order of their ids
+	int changeCapacity = 0;
+	for ( uint32_t k = 0; k < bitSet->blockCount; ++k )
+	{
+		changeCapacity += b3PopCount64( bitSet->bits[k] );
+	}
+
+	int* changedIds = b3StackAlloc( &world->stack, b3MaxInt( changeCapacity, 1 ) * sizeof( int ), "changed contacts" );
+	int changeCount = 0;
 	for ( uint32_t k = 0; k < bitSet->blockCount; ++k )
 	{
 		uint64_t bits = bitSet->bits[k];
 		while ( bits != 0 )
 		{
 			uint32_t ctz = b3CTZ64( bits );
-			int contactId = (int)( 64 * k + ctz );
-
-			b3Contact* contact = b3Array_Get( world->contacts, contactId );
-			B3_ASSERT( contact->setIndex == b3_awakeSet );
-
-			const b3Shape* shapeA = shapes + contact->shapeIdA;
-			const b3Shape* shapeB = shapes + contact->shapeIdB;
-			b3ShapeId shapeIdA = { shapeA->id + 1, worldId, shapeA->generation };
-			b3ShapeId shapeIdB = { shapeB->id + 1, worldId, shapeB->generation };
-			b3ContactId contactFullId = {
-				.index1 = contactId + 1,
-				.world0 = worldId,
-				.padding = 0,
-				.generation = contact->generation,
-			};
-			uint32_t flags = contact->flags;
-
-			if ( flags & b3_simDisjoint )
-			{
-				// Bounding boxes no longer overlap
-				b3DestroyContact( world, contact, false );
-				contact = NULL;
-			}
-			else if ( flags & b3_simStartedTouching )
-			{
-				B3_ASSERT( contact->islandId == B3_NULL_INDEX );
-
-				if ( flags & b3_contactEnableContactEvents )
-				{
-					b3ContactBeginTouchEvent event = { shapeIdA, shapeIdB, contactFullId };
-					b3Array_Push( world->contactBeginEvents, event );
-				}
-
-				B3_ASSERT( contact->manifoldCount > 0 );
-				B3_ASSERT( contact->setIndex == b3_awakeSet );
-
-				// Link first because this wakes colliding bodies and ensures the body sims
-				// are in the correct place.
-				contact->flags &= ~b3_simStartedTouching;
-				contact->flags |= b3_contactTouchingFlag;
-				b3LinkContact( world, contact );
-
-				// Make sure these didn't change
-				B3_ASSERT( contact->colorIndex == B3_NULL_INDEX );
-
-				// Contact sim pointer may have become orphaned due to awake set growth,
-				// so I just need to refresh it.
-
-				int oldLocalIndex = contact->localIndex;
-
-				b3AddContactToGraph( world, contact );
-				b3RemoveNonTouchingContact( world, b3_awakeSet, oldLocalIndex );
-			}
-			else if ( flags & b3_simStoppedTouching )
-			{
-				contact->flags &= ~b3_simStoppedTouching;
-				contact->flags &= ~b3_contactTouchingFlag;
-
-				if ( contact->flags & b3_contactEnableContactEvents )
-				{
-					b3ContactEndTouchEvent event = { shapeIdA, shapeIdB, contactFullId };
-					b3Array_Push( world->contactEndEvents[endEventArrayIndex], event );
-				}
-
-				B3_ASSERT( contact->manifoldCount == 0 );
-
-				// Cache these here for the remove below
-				int colorIndex = contact->colorIndex;
-				int localIndex = contact->localIndex;
-
-				b3UnlinkContact( world, contact );
-				int bodyIdA = contact->edges[0].bodyId;
-				int bodyIdB = contact->edges[1].bodyId;
-
-				b3AddNonTouchingContact( world, contact );
-
-				bool isMeshContact = contact->flags & b3_simMeshContact;
-				b3RemoveContactFromGraph( world, bodyIdA, bodyIdB, colorIndex, localIndex, isMeshContact );
-				contact = NULL;
-			}
+			changedIds[changeCount] = (int)( 64 * k + ctz );
+			changeCount += 1;
 
 			// Clear the smallest set bit
 			bits = bits & ( bits - 1 );
 		}
 	}
+
+	B3_ASSERT( changeCount == changeCapacity );
+
+	// A state change touches the contact, both bodies, and for a destroyed contact its neighbors in the
+	// contact lists of both bodies and the pair set. These are scattered across memory. Looking ahead and
+	// prefetching one level at a time lets the cache misses of many contacts overlap. These are only
+	// hints: it does not matter if an earlier state change relinks or destroys what was prefetched.
+	const int contactLookAhead = 16;
+	const int neighborLookAhead = 8;
+
+	// Process contact state changes
+	for ( int i = 0; i < changeCount; ++i )
+	{
+		if ( i + contactLookAhead < changeCount )
+		{
+			const char* ahead = (const char*)( contacts + changedIds[i + contactLookAhead] );
+			for ( int offset = 0; offset < (int)sizeof( b3Contact ); offset += B3_CACHE_LINE_SIZE )
+			{
+				b3Prefetch( ahead + offset );
+			}
+		}
+
+		if ( i + neighborLookAhead < changeCount )
+		{
+			const b3Contact* ahead = contacts + changedIds[i + neighborLookAhead];
+			const char* bodyA = (const char*)( bodies + ahead->edges[0].bodyId );
+			const char* bodyB = (const char*)( bodies + ahead->edges[1].bodyId );
+			b3Prefetch( bodyA );
+			b3Prefetch( bodyA + sizeof( b3Body ) - 1 );
+			b3Prefetch( bodyB );
+			b3Prefetch( bodyB + sizeof( b3Body ) - 1 );
+
+			if ( ahead->flags & b3_simDisjoint )
+			{
+				for ( int edgeIndex = 0; edgeIndex < 2; ++edgeIndex )
+				{
+					int prevKey = ahead->edges[edgeIndex].prevKey;
+					int nextKey = ahead->edges[edgeIndex].nextKey;
+					if ( prevKey != B3_NULL_INDEX )
+					{
+						b3Prefetch( contacts[prevKey >> 1].edges );
+					}
+
+					if ( nextKey != B3_NULL_INDEX )
+					{
+						b3Prefetch( contacts[nextKey >> 1].edges );
+					}
+				}
+
+				uint64_t pairKey = b3ShapePairKey( ahead->shapeIdA, ahead->shapeIdB, ahead->childIndex );
+				const b3HashSet* pairSet = &world->broadPhase.pairSet;
+				b3Prefetch( pairSet->items + ( b3KeyHash( pairKey ) & ( pairSet->capacity - 1 ) ) );
+			}
+		}
+
+		int contactId = changedIds[i];
+		b3Contact* contact = contacts + contactId;
+		B3_ASSERT( contact->setIndex == b3_awakeSet );
+
+		uint32_t flags = contact->flags;
+
+		if ( flags & b3_simDisjoint )
+		{
+			// Bounding boxes no longer overlap
+			b3DestroyContact( world, contact, false );
+			contact = NULL;
+		}
+		else if ( flags & b3_simStartedTouching )
+		{
+			B3_ASSERT( contact->islandId == B3_NULL_INDEX );
+
+			if ( flags & b3_contactEnableContactEvents )
+			{
+				const b3Shape* shapeA = shapes + contact->shapeIdA;
+				const b3Shape* shapeB = shapes + contact->shapeIdB;
+				b3ShapeId shapeIdA = { shapeA->id + 1, worldId, shapeA->generation };
+				b3ShapeId shapeIdB = { shapeB->id + 1, worldId, shapeB->generation };
+				b3ContactId contactFullId = {
+					.index1 = contactId + 1,
+					.world0 = worldId,
+					.padding = 0,
+					.generation = contact->generation,
+				};
+
+				b3ContactBeginTouchEvent event = { shapeIdA, shapeIdB, contactFullId };
+				b3Array_Push( world->contactBeginEvents, event );
+			}
+
+			B3_ASSERT( contact->manifoldCount > 0 );
+			B3_ASSERT( contact->setIndex == b3_awakeSet );
+
+			// Link first because this wakes colliding bodies and ensures the body sims
+			// are in the correct place.
+			contact->flags &= ~b3_simStartedTouching;
+			contact->flags |= b3_contactTouchingFlag;
+			b3LinkContact( world, contact );
+
+			// Make sure these didn't change
+			B3_ASSERT( contact->colorIndex == B3_NULL_INDEX );
+
+			// Contact sim pointer may have become orphaned due to awake set growth,
+			// so I just need to refresh it.
+
+			int oldLocalIndex = contact->localIndex;
+
+			b3AddContactToGraph( world, contact );
+			b3RemoveNonTouchingContact( world, b3_awakeSet, oldLocalIndex );
+		}
+		else if ( flags & b3_simStoppedTouching )
+		{
+			contact->flags &= ~b3_simStoppedTouching;
+			contact->flags &= ~b3_contactTouchingFlag;
+
+			if ( contact->flags & b3_contactEnableContactEvents )
+			{
+				const b3Shape* shapeA = shapes + contact->shapeIdA;
+				const b3Shape* shapeB = shapes + contact->shapeIdB;
+				b3ShapeId shapeIdA = { shapeA->id + 1, worldId, shapeA->generation };
+				b3ShapeId shapeIdB = { shapeB->id + 1, worldId, shapeB->generation };
+				b3ContactId contactFullId = {
+					.index1 = contactId + 1,
+					.world0 = worldId,
+					.padding = 0,
+					.generation = contact->generation,
+				};
+
+				b3ContactEndTouchEvent event = { shapeIdA, shapeIdB, contactFullId };
+				b3Array_Push( world->contactEndEvents[endEventArrayIndex], event );
+			}
+
+			B3_ASSERT( contact->manifoldCount == 0 );
+
+			// Cache these here for the remove below
+			int colorIndex = contact->colorIndex;
+			int localIndex = contact->localIndex;
+
+			b3UnlinkContact( world, contact );
+			int bodyIdA = contact->edges[0].bodyId;
+			int bodyIdB = contact->edges[1].bodyId;
+
+			b3AddNonTouchingContact( world, contact );
+
+			bool isMeshContact = contact->flags & b3_simMeshContact;
+			b3RemoveContactFromGraph( world, bodyIdA, bodyIdB, colorIndex, localIndex, isMeshContact );
+			contact = NULL;
+		}
+	}
+
+	b3StackFree( &world->stack, changedIds );
+
 
 	b3ValidateSolverSets( world );
 	b3ValidateContacts( world );
@@ -2189,6 +3146,12 @@ void b3World_SetContactRecycleDistance( b3WorldId worldId, float recycleDistance
 	B3_REC( world, WorldSetContactRecycleDistance, worldId, recycleDistance );
 
 	world->contactRecycleDistance = b3ClampFloat( recycleDistance, 0.0f, FLT_MAX );
+
+	// Skip records were stored for the old tolerance
+	if ( world->contactSkips.count > 0 )
+	{
+		memset( world->contactSkips.data, 0, world->contactSkips.count * sizeof( b3ContactSkip ) );
+	}
 }
 
 float b3World_GetContactRecycleDistance( b3WorldId worldId )

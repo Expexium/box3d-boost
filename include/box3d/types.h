@@ -2822,9 +2822,6 @@ typedef struct b3ManifoldPoint
 /// @note Box3D uses speculative collision so some contact points may be separated.
 typedef struct b3Manifold
 {
-	/// The manifold points. There may be 1 to 4 valid points.
-	b3ManifoldPoint points[B3_MAX_MANIFOLD_POINTS];
-
 	/// The unit normal vector in world space, points from shape A to shape B
 	b3Vec3 normal;
 
@@ -2839,6 +2836,10 @@ typedef struct b3Manifold
 
 	/// The number of contact points, will be 0 to 4
 	int pointCount;
+
+	/// The manifold points. There may be 1 to 4 valid points. These come last so the data shared by
+	/// all points and the first points, which are always used, sit together in memory.
+	b3ManifoldPoint points[B3_MAX_MANIFOLD_POINTS];
 
 } b3Manifold;
 

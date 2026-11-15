@@ -186,10 +186,14 @@ static const b3BodyState b3_identityBodyState = {
 
 // Body simulation data used for integration of position and velocity
 // Transform data used for collision and solver preparation.
+// The fields are grouped by who reads them so each reader touches as few cache lines as possible.
+// Body sims are stored in cache aligned arrays.
 typedef struct b3BodySim
 {
+	// First cache line: everything the narrow phase reads to test and refresh a contact.
+
 	// transform for body origin, double translation in large world mode
-	b3WorldTransform transform;
+	_Alignas( B3_CACHE_LINE_SIZE ) b3WorldTransform transform;
 
 	// center of mass position in world space
 	b3Pos center;
@@ -199,6 +203,9 @@ typedef struct b3BodySim
 
 	float minExtent;
 	b3Vec3 maxExtent;
+
+	// Index of b3Body
+	int bodyId;
 
 	// previous rotation and COM for TOI
 	b3Quat rotation0;
@@ -210,22 +217,20 @@ typedef struct b3BodySim
 	b3Vec3 force;
 	b3Vec3 torque;
 
-	float invMass;
-
 	// Local space inertia
 	b3Matrix3 inertia;
 
 	// Rotational inertia about the center of mass. The world space inverse inertia tensor
 	// must be updated whenever the body rotation is modified.
 	b3Matrix3 invInertiaLocal;
+
+	// Last cache line (in single precision): the mass properties the constraint preparation reads.
 	b3Matrix3 invInertiaWorld;
+	float invMass;
 
 	float linearDamping;
 	float angularDamping;
 	float gravityScale;
-
-	// Index of b3Body
-	int bodyId;
 } b3BodySim;
 
 // Get a validated body from a world using an id.
@@ -250,6 +255,22 @@ bool b3WakeBodyWithLock( b3World* world, b3Body* body );
 void b3UpdateBodyMassData( b3World* world, b3Body* body );
 void b3SyncBodyFlags( b3World* world, b3Body* body );
 void b3RefreshBodyContactIndices( b3World* world, b3Body* body );
+
+// Advance the motion epochs of a body. Call this when anything changes that the contact recycling test
+// depends on without being visible as motion of an awake body, and when a body enters the awake set.
+// Nothing is needed for a body that is asleep or disabled, its skip records ended when it left the awake set.
+static inline void b3BumpBodyEpoch( b3World* world, int bodyId )
+{
+	const b3Body* body = world->bodies.data + bodyId;
+	if ( body->setIndex == b3_awakeSet )
+	{
+		b3BumpSkipSlot( world, body->localIndex + 1 );
+	}
+	else if ( body->setIndex == b3_staticSet )
+	{
+		b3BumpSkipSlot( world, B3_SKIP_STATIC_SLOT );
+	}
+}
 
 // Encode the body sim index for storage in the contact.
 static inline int b3EncodeBodySimIndex( const b3Body* body )

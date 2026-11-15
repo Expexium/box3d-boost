@@ -70,7 +70,61 @@ void b3DestroyGraph( b3ConstraintGraph* graph )
 		b3Array_Destroy( color->convexContacts );
 		b3Array_Destroy( color->contacts );
 		b3Array_Destroy( color->jointSims );
+		b3Array_Destroy( color->sphericalJoints );
+		b3Array_Destroy( color->revoluteJoints );
+		b3Array_Destroy( color->scalarJoints );
 	}
+}
+
+void b3UpdateJointLayout( b3GraphColor* color )
+{
+	if ( color->jointLayoutDirty == false )
+	{
+		return;
+	}
+
+	b3Array_Clear( color->sphericalJoints );
+	b3Array_Clear( color->revoluteJoints );
+	b3Array_Clear( color->scalarJoints );
+
+	const b3JointSim* joints = color->jointSims.data;
+	int jointCount = color->jointSims.count;
+	int filterCount = 0;
+	for ( int i = 0; i < jointCount; ++i )
+	{
+		switch ( joints[i].type )
+		{
+			case b3_sphericalJoint:
+				b3Array_Push( color->sphericalJoints, i );
+				break;
+
+			case b3_revoluteJoint:
+				b3Array_Push( color->revoluteJoints, i );
+				break;
+
+			case b3_filterJoint:
+				filterCount += 1;
+				break;
+
+			default:
+				b3Array_Push( color->scalarJoints, i );
+				break;
+		}
+	}
+
+	color->scalarSolveCount = color->scalarJoints.count;
+
+	// Filter joints go last
+	for ( int i = 0; i < jointCount && filterCount > 0; ++i )
+	{
+		if ( joints[i].type == b3_filterJoint )
+		{
+			b3Array_Push( color->scalarJoints, i );
+			filterCount -= 1;
+		}
+	}
+
+	color->jointLayoutDirty = false;
 }
 
 // Contacts are always created as non-touching. They get cloned into the constraint
@@ -287,6 +341,7 @@ b3JointSim* b3CreateJointInGraph( b3World* world, b3Joint* joint )
 
 	b3JointSim* jointSim = b3Array_Emplace( graph->colors[colorIndex].jointSims );
 	memset( jointSim, 0, sizeof( b3JointSim ) );
+	graph->colors[colorIndex].jointLayoutDirty = true;
 
 	joint->colorIndex = colorIndex;
 	joint->localIndex = graph->colors[colorIndex].jointSims.count - 1;
@@ -312,6 +367,8 @@ void b3RemoveJointFromGraph( b3World* world, int bodyIdA, int bodyIdB, int color
 		b3ClearBit( &color->bodySet, bodyIdA );
 		b3ClearBit( &color->bodySet, bodyIdB );
 	}
+
+	color->jointLayoutDirty = true;
 
 	int movedIndex = b3Array_RemoveSwap( color->jointSims, localIndex );
 	if ( movedIndex != B3_NULL_INDEX )

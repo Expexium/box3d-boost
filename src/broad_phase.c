@@ -747,8 +747,78 @@ void b3UpdateBroadPhasePairs( b3World* world )
 #undef SWAP
 	}
 
+	// Creating a contact touches two shapes, two bodies, the contact at the head of the contact list of
+	// each body, the pair set, and the new contact. These are scattered across memory and each one is
+	// only known once the previous one has been loaded. Looking ahead in the keys and prefetching one
+	// level at a time lets the cache misses of many contacts overlap. These are only hints: a key
+	// that does not create a contact or a stale list head just wastes a prefetch.
+	const int shapeLookAhead = 24;
+	const int bodyLookAhead = 16;
+	const int contactLookAhead = 8;
+	const b3Shape* shapes = world->shapes.data;
+	const b3Body* bodies = world->bodies.data;
+
 	for ( int i = 0; i < keyCount; ++i )
 	{
+		if ( i + shapeLookAhead < keyCount )
+		{
+			// The first two cache lines of a shape hold what contact creation reads
+			uint64_t aheadKey = pairKeys[i + shapeLookAhead];
+			const char* shapeA = (const char*)( shapes + (int)( ( aheadKey >> ( 64 - B3_SHAPE_POWER ) ) & B3_SHAPE_MASK ) );
+			const char* shapeB = (const char*)( shapes + (int)( ( aheadKey >> ( 64 - 2 * B3_SHAPE_POWER ) ) & B3_SHAPE_MASK ) );
+			b3Prefetch( shapeA );
+			b3Prefetch( shapeA + B3_CACHE_LINE_SIZE );
+			b3Prefetch( shapeB );
+			b3Prefetch( shapeB + B3_CACHE_LINE_SIZE );
+			b3PrefetchHash( &bp->pairSet, b3KeyHash( aheadKey ) );
+		}
+
+		if ( i + bodyLookAhead < keyCount )
+		{
+			uint64_t aheadKey = pairKeys[i + bodyLookAhead];
+			const char* bodyA = (const char*)( bodies + shapes[( aheadKey >> ( 64 - B3_SHAPE_POWER ) ) & B3_SHAPE_MASK].bodyId );
+			const char* bodyB = (const char*)( bodies + shapes[( aheadKey >> ( 64 - 2 * B3_SHAPE_POWER ) ) & B3_SHAPE_MASK].bodyId );
+			b3Prefetch( bodyA );
+			b3Prefetch( bodyA + sizeof( b3Body ) - 1 );
+			b3Prefetch( bodyB );
+			b3Prefetch( bodyB + sizeof( b3Body ) - 1 );
+		}
+
+		if ( i + contactLookAhead < keyCount )
+		{
+			uint64_t aheadKey = pairKeys[i + contactLookAhead];
+			const b3Body* bodyA = bodies + shapes[( aheadKey >> ( 64 - B3_SHAPE_POWER ) ) & B3_SHAPE_MASK].bodyId;
+			const b3Body* bodyB = bodies + shapes[( aheadKey >> ( 64 - 2 * B3_SHAPE_POWER ) ) & B3_SHAPE_MASK].bodyId;
+			const b3Contact* contacts = world->contacts.data;
+
+			// The edges of the contacts the new contact gets linked in front of
+			if ( bodyA->headContactKey != B3_NULL_INDEX )
+			{
+				b3Prefetch( contacts[bodyA->headContactKey >> 1].edges );
+			}
+
+			if ( bodyB->headContactKey != B3_NULL_INDEX )
+			{
+				b3Prefetch( contacts[bodyB->headContactKey >> 1].edges );
+			}
+
+			// The slot the new contact will most likely get, and its skip record
+			int nextId = b3PeekId( &world->contactIdPool, contactLookAhead );
+			if ( nextId < world->contacts.capacity )
+			{
+				const char* slot = (const char*)( contacts + nextId );
+				for ( int offset = 0; offset < (int)sizeof( b3Contact ); offset += B3_CACHE_LINE_SIZE )
+				{
+					b3Prefetch( slot + offset );
+				}
+			}
+
+			if ( nextId < world->contactSkips.count )
+			{
+				b3Prefetch( world->contactSkips.data + nextId );
+			}
+		}
+
 		uint64_t key = pairKeys[i];
 
 		// The traversal is cross subtree and the seeds are disjoint, so a duplicate key means a

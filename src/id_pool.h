@@ -12,6 +12,14 @@ typedef struct b3IdPool
 } b3IdPool;
 
 b3IdPool b3CreateIdPool( void );
+
+// The id b3AllocId will return after `skip` more calls, as long as no id is freed before then.
+// Useful for prefetching the slot of an id before it is allocated.
+static inline int b3PeekId( const b3IdPool* pool, int skip )
+{
+	int freeCount = pool->freeArray.count;
+	return skip < freeCount ? pool->freeArray.data[freeCount - 1 - skip] : pool->nextIndex + ( skip - freeCount );
+}
 void b3DestroyIdPool( b3IdPool* pool );
 
 int b3AllocId( b3IdPool* pool );

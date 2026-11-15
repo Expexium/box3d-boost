@@ -182,4 +182,6 @@ B3_INLINE int b3RemoveHelper( void* data, int* count, int index, int elementSize
 #define b3Array_ByteCount( a ) ( ( a ).capacity * (int)sizeof( *( a ).data ) )
 
 b3DeclareArrayNative( int );
+b3DeclareArrayNative( float );
+b3DeclareArrayNative( uint32_t );
 b3DeclareArrayNative( uint64_t );

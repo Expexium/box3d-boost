@@ -151,6 +151,11 @@ static inline bool b3AnyTrueW8( b3FloatW8 mask )
 	return _mm256_movemask_ps( mask ) != 0;
 }
 
+static inline int b3MoveMaskW8( b3FloatW8 mask )
+{
+	return _mm256_movemask_ps( mask );
+}
+
 // Component-wise returns mask ? b : a
 static inline b3FloatW8 b3BlendW8( b3FloatW8 a, b3FloatW8 b, b3FloatW8 mask )
 {

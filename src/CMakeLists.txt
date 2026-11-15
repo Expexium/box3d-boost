@@ -39,10 +39,13 @@ set(BOX3D_SOURCE_FILES
 	hull.h
 	id_pool.c
 	id_pool.h
+	collide_wide.inl
+	integrate_wide.inl
 	island.c
 	island.h
 	joint.c
 	joint.h
+	joint_solver_wide.inl
 	manifold.c
 	manifold.h
 	math_functions.c

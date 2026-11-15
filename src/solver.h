@@ -68,14 +68,17 @@ typedef struct b3World b3World;
 typedef enum b3SolverStageType
 {
 	b3_stagePrepareJoints,
+	b3_stagePrepareWideJoints,
 	b3_stagePrepareWideContacts,
 	b3_stagePrepareContacts,
+	b3_stagePrepareIntegration,
 	b3_stageIntegrateVelocities,
 	b3_stageWarmStart,
 	b3_stageSolve,
 	b3_stageIntegratePositions,
 	b3_stageRelax,
 	b3_stageRestitution,
+	b3_stageStoreWideJoints,
 	b3_stageStoreWideImpulses,
 	b3_stageStoreImpulses,
 } b3SolverStageType;
@@ -94,8 +97,15 @@ typedef enum b3SolverBlockType
 	// Block for iterating across contacts. For prepare and store.
 	b3_contactBlock,
 
-	// Block for iterating across joints of a single graph color.
+	// Block for iterating across wide joints of all graph colors. For prepare and store.
+	b3_wideJointBlock,
+
+	// Block for iterating across the joints of a single graph color that are solved one at a time.
 	b3_graphJointBlock,
+
+	// Blocks for iterating across the wide joints of a single graph color.
+	b3_graphSphericalBlock,
+	b3_graphRevoluteBlock,
 
 	// Block for iterating across wide contacts of a single graph color.
 	b3_graphWideContactBlock,
@@ -171,11 +181,13 @@ typedef struct b3MeshPrepareSpan
 	int* order;
 } b3MeshPrepareSpan;
 
+// The joints of a color that are prepared one at a time, as indices into the joints of the color
 typedef struct b3JointPrepareSpan
 {
 	int start;
 	int count;
 	b3JointSim* joints;
+	const int* indices;
 } b3JointPrepareSpan;
 
 // Context for a time step. Recreated each time step.
@@ -219,7 +231,13 @@ typedef struct b3StepContext
 
 	// Contact ids for simplified parallel-for access. Used in narrow-phase.
 	// These contacts may or may not be touching. They are associated with awake bodies.
+	// The touching contacts come first, followed by the non-touching contacts.
 	int* awakeContactIndices;
+	int touchingContactCount;
+
+	// The contact solver runs on this step, so the narrow phase can leave the manifold refresh of a
+	// recycled or skipped touching contact to the contact solver preparation. See b3ContactSkip.
+	bool deferContactRefresh;
 
 	// Flat view of the wide contact constraint array used by prepare and store.
 	// prepareSpans has activeColorCount + 1 entries, the last being a sentinel
@@ -235,6 +253,19 @@ typedef struct b3StepContext
 	int* wideMeshManifoldStarts;
 	b3MeshPrepareSpan* meshPrepareSpans;
 	b3JointPrepareSpan* jointPrepareSpans;
+
+	// Flat view of the wide joints of all colors used by prepare and store. The spherical joints come
+	// first, followed by the revolute joints. wideJointSims has simd width joints per wide joint, in the
+	// same order, with null for unused lanes. Per-color slices live on the graph colors.
+	void* wideSphericalJoints;
+	void* wideRevoluteJoints;
+	b3JointSim** wideJointSims;
+	int wideSphericalCount;
+	int wideRevoluteCount;
+
+	// Per step constants for wide body integration, one entry per group of simd width awake bodies.
+	// See integrate_wide.inl. Null when bodies are integrated one at a time.
+	void* wideIntegrateData;
 
 	int activeColorCount;
 	int workerCount;
@@ -268,6 +299,49 @@ typedef struct b3StepContext
 } b3StepContext;
 
 void b3Solve( b3World* world, b3StepContext* stepContext );
+
+// Wide body integration, see integrate_wide.inl. The scalar SIMD fallback integrates one body at a time
+// because the wide version carries the body flags through SIMD registers as raw bits.
+#if defined( B3_SIMD_ENABLED )
+#define B3_WIDE_INTEGRATION 1
+#else
+#define B3_WIDE_INTEGRATION 0
+#endif
+
+// Results of the wide part of body finalization, one body per lane. See b3FinalizeBodyMathW8.
+typedef struct b3FinalizeLanes
+{
+	// The advanced rotation
+	_Alignas( 32 ) float qx[8];
+	float qy[8];
+	float qz[8];
+	float qs[8];
+
+	// The local center of mass rotated by the advanced rotation
+	float centerX[8];
+	float centerY[8];
+	float centerZ[8];
+
+	// World space inverse inertia for the advanced rotation, column by column
+	float invInertia[9][8];
+
+	float maxVelocity[8];
+	float maxDeltaPosition[8];
+	float sleepVelocity[8];
+} b3FinalizeLanes;
+
+void b3FinalizeBodyMathW4( const b3BodySim* sims, const b3BodyState* states, int laneCount, float invTimeStep, b3FinalizeLanes* lanes );
+void b3FinalizeBodyMathW8( const b3BodySim* sims, const b3BodyState* states, int laneCount, float invTimeStep, b3FinalizeLanes* lanes );
+
+int b3GetIntegrateDataByteCountW4( void );
+void b3PrepareIntegrationW4( b3SolverBlock block, b3StepContext* context );
+void b3IntegrateVelocitiesW4( b3SolverBlock block, b3StepContext* context );
+void b3IntegratePositionsW4( b3SolverBlock block, b3StepContext* context );
+
+int b3GetIntegrateDataByteCountW8( void );
+void b3PrepareIntegrationW8( b3SolverBlock block, b3StepContext* context );
+void b3IntegrateVelocitiesW8( b3SolverBlock block, b3StepContext* context );
+void b3IntegratePositionsW8( b3SolverBlock block, b3StepContext* context );
 
 static inline b3Softness b3MakeSoft( float hertz, float zeta, float h )
 {

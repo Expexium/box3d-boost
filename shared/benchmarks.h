@@ -52,6 +52,14 @@ void GetSpinnerCapacity( b3Capacity* capacity );
 void CreateSpinner( b3WorldId worldId );
 void DestroySpinner( void );
 float GetSpinnerAngle( void );
+void GetRagdollPileCapacity( b3Capacity* capacity );
+void CreateRagdollPile( b3WorldId worldId );
+void DestroyRagdollPile( void );
+
+void GetConvexFieldCapacity( b3Capacity* capacity );
+void CreateConvexField( b3WorldId worldId );
+void CreateConvexFieldTerrain( b3WorldId worldId );
+void DestroyConvexField( void );
 void GetSleepCapacity( b3Capacity* capacity );
 void CreateSleep( b3WorldId worldId );
 void StepSleep( b3WorldId worldId, int stepCount );

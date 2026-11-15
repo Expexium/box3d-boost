@@ -11,6 +11,7 @@
 #include "id_pool.h"
 #include "name_cache.h"
 
+#include "box3d/constants.h"
 #include "box3d/types.h"
 
 #define B3_DEBUG_POINT_CAPACITY 64
@@ -122,6 +123,96 @@ typedef struct b3TaskContext
 
 b3DeclareArray( b3TaskContext );
 
+// Contact skip cache
+//
+// Most contacts in a pile are not touching, their shapes merely have overlapping bounding boxes. Each
+// step the narrow phase still has to load such a contact, both shapes, and both bodies only to discover
+// that nothing moved enough to matter (the contact recycling test passes and there is no manifold to
+// refresh). The skip cache lets the narrow phase reach the same decision from 16 bytes per contact.
+//
+// Every awake body has a motion epoch. The epoch advances when the body leaves a small window around the
+// pose it had when the epoch started, when one of its bounding boxes is enlarged, when it is fast, or
+// has its mass data or shapes modified. So while the epoch holds, the body has barely moved.
+//
+// When the narrow phase finds a contact that passes the recycling test with enough room to spare for the
+// worst motion two epoch windows allow, it stores both body epochs in the skip record. On later steps,
+// if both epochs still match, the recycling test is guaranteed to pass again, so the contact is skipped
+// without being loaded. This never changes simulation results.
+//
+// A recycled contact that is touching still needs its manifold separations refreshed from the current
+// body transforms. On a step that runs the solver that work is deferred to the contact solver
+// preparation, which has to load the contact, manifold, and bodies anyway. The narrow phase only raises
+// a flag, both for a contact it skipped and for one it recycled with the regular test.
+//
+// A contact that has little room left in the recycling test needs a small window, while a large window
+// survives more motion. So each body keeps several epochs, one per window size, and a skip record refers
+// to the largest window the contact can afford.
+//
+// Epochs live in slots. Slot i + 1 belongs to the awake body sim with index i and remembers which body
+// it tracks. When a different body shows up at that index the slot starts over with new epochs, so the
+// cache needs no upkeep as bodies move around the awake set, sleep, or get destroyed. Slot 0 is shared
+// by all static bodies. They never move on their own, so one slot that advances on the rare edit of a
+// static body is enough. This keeps the cache proportional to the number of awake bodies.
+
+// Number of window sizes per body
+#define B3_SKIP_LEVEL_COUNT 3
+
+// Each level has a window this many times smaller than the previous level
+#define B3_SKIP_LEVEL_RATIO 8.0f
+
+// Linear size of the largest body motion window. Usually meters.
+#define B3_SKIP_LINEAR_WINDOW ( 0.025f * B3_SPECULATIVE_DISTANCE )
+
+// Largest rotation window, as a distance between unit quaternions (about half the angle in radians).
+#define B3_SKIP_MAX_QUAT_WINDOW 5.0e-4f
+
+// The epoch slot shared by all static bodies
+#define B3_SKIP_STATIC_SLOT 0
+
+// Pose a body had when a motion epoch last advanced
+typedef struct b3BodyPoseRef
+{
+	b3Pos p;
+	b3Quat q;
+} b3BodyPoseRef;
+
+// Motion tracking for one awake body sim index
+typedef struct b3BodyMotionRef
+{
+	// The body this slot is tracking, to detect a different body moving into this sim index
+	int bodyId;
+
+	b3BodyPoseRef levels[B3_SKIP_LEVEL_COUNT];
+} b3BodyMotionRef;
+
+// The epoch index of body A in a skip record also carries the manifold count bucket of a touching
+// contact in its top bits. This lets the narrow phase keep the manifold statistics without loading the
+// contact. The bucket is zero for a contact that is not touching.
+#define B3_SKIP_BUCKET_SHIFT 28
+#define B3_SKIP_INDEX_MASK ( ( 1 << B3_SKIP_BUCKET_SHIFT ) - 1 )
+
+// Indexed by contact id. Valid while both epochs match the slot epochs. A zero epoch never matches.
+typedef struct b3ContactSkip
+{
+	// Index into the flat array of epochs: B3_SKIP_LEVEL_COUNT * slot + level
+	// The index of body A has the manifold bucket in the top bits.
+	int epochIndexA;
+	int epochIndexB;
+	uint32_t epochA;
+	uint32_t epochB;
+} b3ContactSkip;
+
+// One bit per level, set when a body left that window on the current step
+typedef uint8_t b3MotionMask;
+
+// Non-zero when the narrow phase recycled or skipped a touching contact, so its manifolds still need a refresh
+typedef uint8_t b3RefreshFlag;
+
+b3DeclareArray( b3BodyMotionRef );
+b3DeclareArray( b3ContactSkip );
+b3DeclareArrayNative( b3MotionMask );
+b3DeclareArrayNative( b3RefreshFlag );
+
 // The world struct manages all physics entities, dynamic simulation,  and asynchronous queries.
 // The world also contains efficient memory management facilities.
 typedef struct b3World
@@ -181,6 +272,35 @@ typedef struct b3World
 
 	// This follows the shape array and is split out for the hot path in the narrow phase.
 	b3Array( b3AABB ) fatAABBs;
+
+	// Contact skip cache, see b3ContactSkip. These are sized at the start of the narrow phase.
+	// B3_SKIP_LEVEL_COUNT epochs per slot, kept flat and separate for fast lookup in the narrow phase
+	b3Array( uint32_t ) bodyEpochs;
+
+	// One per slot. Used to avoid storing skip records for bodies in motion.
+	b3Array( b3MotionMask ) bodyMotionMasks;
+
+	// One per slot. The largest rotation window of the body, zero for the static slot.
+	b3Array( float ) bodyQuatWindows;
+
+	// One per awake body sim index. The static slot has none.
+	b3Array( b3BodyMotionRef ) bodyMotionRefs;
+
+	// Number of awake body sims at the previous narrow phase
+	int skipBodyCount;
+
+	// Skip records indexed by contact id
+	b3Array( b3ContactSkip ) contactSkips;
+
+	// Deferred manifold refresh flags indexed by contact id. The narrow phase writes these for every
+	// touching contact and the contact solver preparation consumes them.
+	b3Array( b3RefreshFlag ) contactRefreshFlags;
+
+	// Number of awake bodies that left every motion window on the current step
+	b3AtomicInt movingBodyCount;
+
+	// Looking up skip records is wasted work while most bodies are moving, so it is decided per step
+	bool useContactSkips;
 
 	// Compound shapes are static only, so only the broad-phase static pass can meet one. This
 	// lets a world without compounds skip the shape type read in the pair batch.
@@ -323,6 +443,34 @@ static inline int b3GetSolverSetCount( const b3World* world )
 	return b3_firstSleepingSet + world->sleepingSets.count;
 }
 
+// Advance all the motion epochs of a slot. This kills every contact skip record that refers to the slot,
+// so those contacts go through the regular narrow phase on the next step.
+static inline void b3BumpSkipSlot( b3World* world, int slot )
+{
+	// Slots beyond the array have no skip records yet
+	int base = B3_SKIP_LEVEL_COUNT * slot;
+	if ( base + B3_SKIP_LEVEL_COUNT <= world->bodyEpochs.count )
+	{
+		uint32_t* epochs = world->bodyEpochs.data + base;
+		for ( int level = 0; level < B3_SKIP_LEVEL_COUNT; ++level )
+		{
+			uint32_t epoch = epochs[level] + 1;
+
+			// Zero is reserved for invalid skip records
+			epochs[level] = epoch == 0 ? 1 : epoch;
+		}
+	}
+}
+
+// Largest rotation window of a body for the contact skip cache. Sized so the farthest point of the body
+// sweeps about the same distance as the linear window. Must only depend on the body extent.
+static inline float b3GetSkipQuatWindow( b3Vec3 maxExtent )
+{
+	float extent = b3Length( maxExtent );
+	float window = 0.5f * B3_SKIP_LINEAR_WINDOW / ( extent + B3_SKIP_LINEAR_WINDOW );
+	return b3MinFloat( window, B3_SKIP_MAX_QUAT_WINDOW );
+}
+
 b3World* b3GetUnlockedWorldFromId( b3WorldId id );
 b3World* b3GetWorldFromId( b3WorldId id );
 
@@ -360,7 +508,11 @@ static inline b3Manifold* b3AllocateManifolds( b3World* world, int count )
 	int currentCount = world->manifoldAllocators.count;
 	for ( int i = currentCount; i < count; ++i )
 	{
-		b3BlockAllocator allocator = b3CreateBlockAllocator( ( i + 1 ) * sizeof( b3Manifold ), 2 * B3_BLOCK_SIZE );
+		// The stride is a multiple of the cache line size so every allocation starts on a cache line. The
+		// normal and the first point of a manifold are then always the same two cache lines.
+		int elementSize = ( i + 1 ) * (int)sizeof( b3Manifold );
+		elementSize = ( ( elementSize - 1 ) | ( B3_CACHE_LINE_SIZE - 1 ) ) + 1;
+		b3BlockAllocator allocator = b3CreateBlockAllocator( elementSize, 2 * B3_BLOCK_SIZE );
 		b3Array_Push( world->manifoldAllocators, allocator );
 	}
 

@@ -1649,6 +1649,14 @@ static void b3UpdateHullEdgeCosines( b3HullData* hull )
 
 int b3FindHullSupportVertex( const b3HullData* hull, b3Vec3 direction )
 {
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	// Same result with half the iterations
+	if ( b3GetSIMDWidth() == 8 )
+	{
+		return b3FindHullSupportVertexW8( hull, direction );
+	}
+#endif
+
 	int bestIndex = B3_NULL_INDEX;
 	float bestDot = -FLT_MAX;
 

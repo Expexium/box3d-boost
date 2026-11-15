@@ -50,6 +50,7 @@ typedef B3_WIDE( b3Vec3 ) b3Vec3W;
 #define b3EqualsW B3_WIDE( b3Equals )
 #define b3AllZeroW B3_WIDE( b3AllZero )
 #define b3AnyTrueW B3_WIDE( b3AnyTrue )
+#define b3MoveMaskW B3_WIDE( b3MoveMask )
 #define b3BlendW B3_WIDE( b3Blend )
 #define b3EmbedIndexW B3_WIDE( b3EmbedIndex )
 #define b3MinIndexW B3_WIDE( b3MinIndex )

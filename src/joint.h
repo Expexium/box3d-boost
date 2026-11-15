@@ -390,6 +390,34 @@ void b3PrepareJoint( b3JointSim* joint, b3StepContext* context );
 void b3WarmStartJoint( b3JointSim* joint, b3StepContext* context );
 void b3SolveJoint( b3JointSim* joint, b3StepContext* context, bool useBias );
 
+// Wide solver for spherical and revolute joints, see joint_solver_wide.inl. These pick the SIMD width.
+int b3GetWideSphericalJointByteCount( int simdWidth );
+int b3GetWideRevoluteJointByteCount( int simdWidth );
+void b3PrepareWideJoints( b3SolverBlock block, b3StepContext* context );
+void b3StoreWideJoints( b3SolverBlock block, b3StepContext* context );
+void b3WarmStartSphericalJoints( b3SolverBlock block, b3StepContext* context );
+void b3SolveSphericalJoints( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+void b3WarmStartRevoluteJoints( b3SolverBlock block, b3StepContext* context );
+void b3SolveRevoluteJoints( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+
+int b3GetWideSphericalJointByteCountW4( void );
+int b3GetWideRevoluteJointByteCountW4( void );
+void b3PrepareWideJointsW4( b3SolverBlock block, b3StepContext* context );
+void b3StoreWideJointsW4( b3SolverBlock block, b3StepContext* context );
+void b3WarmStartSphericalJointsW4( b3SolverBlock block, b3StepContext* context );
+void b3SolveSphericalJointsW4( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+void b3WarmStartRevoluteJointsW4( b3SolverBlock block, b3StepContext* context );
+void b3SolveRevoluteJointsW4( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+
+int b3GetWideSphericalJointByteCountW8( void );
+int b3GetWideRevoluteJointByteCountW8( void );
+void b3PrepareWideJointsW8( b3SolverBlock block, b3StepContext* context );
+void b3StoreWideJointsW8( b3SolverBlock block, b3StepContext* context );
+void b3WarmStartSphericalJointsW8( b3SolverBlock block, b3StepContext* context );
+void b3SolveSphericalJointsW8( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+void b3WarmStartRevoluteJointsW8( b3SolverBlock block, b3StepContext* context );
+void b3SolveRevoluteJointsW8( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex );
+
 void b3PrepareJoints_Overflow( b3StepContext* context );
 void b3WarmStartJoints_Overflow( b3StepContext* context );
 void b3SolveJoints_Overflow( b3StepContext* context, bool useBias );

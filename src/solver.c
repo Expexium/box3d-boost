@@ -62,6 +62,11 @@ typedef struct b3WorkerContext
 	void* userTask;
 } b3WorkerContext;
 
+// The two tasks below integrate one body at a time. They are the reference for the wide versions in
+// integrate_wide.inl, which replace them whenever SIMD is available and must give identical results.
+// A change here must be mirrored there.
+#if B3_WIDE_INTEGRATION == 0
+
 // Integrate velocities, apply damping, and gyroscopic torque
 static void b3IntegrateVelocitiesTask( b3SolverBlock block, b3StepContext* context )
 {
@@ -223,6 +228,64 @@ static void b3IntegratePositionsTask( b3SolverBlock block, b3StepContext* contex
 	b3TracyCZoneEnd( integrate_positions );
 }
 
+#else
+
+// Wide body integration picks the SIMD width of the world
+
+static int b3GetIntegrateDataByteCount( int simdWidth )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( simdWidth == 8 )
+	{
+		return b3GetIntegrateDataByteCountW8();
+	}
+#endif
+
+	B3_UNUSED( simdWidth );
+	return b3GetIntegrateDataByteCountW4();
+}
+
+static void b3PrepareIntegration( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3PrepareIntegrationW8( block, context );
+		return;
+	}
+#endif
+
+	b3PrepareIntegrationW4( block, context );
+}
+
+static void b3IntegrateVelocities( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3IntegrateVelocitiesW8( block, context );
+		return;
+	}
+#endif
+
+	b3IntegrateVelocitiesW4( block, context );
+}
+
+static void b3IntegratePositions( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3IntegratePositionsW8( block, context );
+		return;
+	}
+#endif
+
+	b3IntegratePositionsW4( block, context );
+}
+
+#endif
+
 static void b3PrepareJointsTask( b3SolverBlock block, b3StepContext* context )
 {
 	b3TracyCZoneNC( prepare_joints, "PrepJoints", b3_colorOldLace, true );
@@ -245,12 +308,13 @@ static void b3PrepareJointsTask( b3SolverBlock block, b3StepContext* context )
 		int colorStart = spans[colorIndex].start;
 		int colorEndIndex = b3MinInt( spans[colorIndex + 1].start, endIndex );
 		b3JointSim* joints = spans[colorIndex].joints;
+		const int* indices = spans[colorIndex].indices;
 
 		// Loop over color
 		for ( ; index < colorEndIndex; ++index )
 		{
 			B3_ASSERT( 0 <= index - colorStart && index - colorStart < spans[colorIndex].count );
-			b3JointSim* joint = joints + ( index - colorStart );
+			b3JointSim* joint = joints + indices[index - colorStart];
 			b3PrepareJoint( joint, context );
 		}
 
@@ -265,12 +329,14 @@ static void b3WarmStartJointsTask( b3SolverBlock block, b3StepContext* context )
 {
 	b3TracyCZoneNC( warm_joints, "WarmJoints", b3_colorGold, true );
 
+	// The block is a range of the joints in this color that are solved one at a time
 	b3GraphColor* color = context->graph->colors + block.colorIndex;
 	b3JointSim* joints = color->jointSims.data;
+	const int* indices = color->scalarJoints.data;
 
 	for ( int i = block.startIndex; i < block.startIndex + block.count; ++i )
 	{
-		b3JointSim* joint = joints + i;
+		b3JointSim* joint = joints + indices[i];
 		b3WarmStartJoint( joint, context );
 	}
 
@@ -281,16 +347,18 @@ static void b3SolveJointsTask( b3SolverBlock block, b3StepContext* context, bool
 {
 	b3TracyCZoneNC( solve_joints, "SolveJoints", b3_colorLemonChiffon, true );
 
+	// The block is a range of the joints in this color that are solved one at a time
 	b3GraphColor* color = context->graph->colors + block.colorIndex;
 	b3JointSim* joints = color->jointSims.data;
+	const int* indices = color->scalarJoints.data;
 
-	B3_ASSERT( 0 <= block.startIndex && block.startIndex + block.count <= color->jointSims.count );
+	B3_ASSERT( 0 <= block.startIndex && block.startIndex + block.count <= color->scalarSolveCount );
 
 	b3BitSet* jointStateBitSet = &context->world->taskContexts.data[workerIndex].jointStateBitSet;
 
 	for ( int i = block.startIndex; i < block.startIndex + block.count; ++i )
 	{
-		b3JointSim* joint = joints + i;
+		b3JointSim* joint = joints + indices[i];
 		b3SolveJoint( joint, context, useBias );
 
 		if ( useBias && ( joint->forceThreshold < FLT_MAX || joint->torqueThreshold < FLT_MAX ) &&
@@ -621,6 +689,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 			if ( b3AABB_Contains( *shapeFatAABB, aabb ) == false )
 			{
 				*shapeFatAABB = b3AABB_Inflate( aabb, shape->aabbMargin );
+				b3BumpBodyEpoch( world, fastBodySim->bodyId );
 
 				// Regular bodies mark the hierarchy as moved using atomic operations.
 				// Bullets are handled separately at a later stage.
@@ -657,6 +726,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 			if ( b3AABB_Contains( *shapeFatAABB, shape->aabb ) == false )
 			{
 				*shapeFatAABB = b3AABB_Inflate( shape->aabb, shape->aabbMargin );
+				b3BumpBodyEpoch( world, fastBodySim->bodyId );
 
 				if ( isBullet == false )
 				{
@@ -690,6 +760,76 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 }
 
 // Implements b3ParallelForCallback
+// The math of body finalization for a group of consecutive bodies. Returns the results in lanes.
+static inline void b3FinalizeBodyMath( const b3World* world, const b3BodySim* sims, const b3BodyState* states, int laneCount,
+									   float invTimeStep, b3FinalizeLanes* lanes )
+{
+#if B3_WIDE_INTEGRATION
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( world->simdWidth == 8 )
+	{
+		b3FinalizeBodyMathW8( sims, states, laneCount, invTimeStep, lanes );
+		return;
+	}
+#endif
+
+	b3FinalizeBodyMathW4( sims, states, laneCount, invTimeStep, lanes );
+#else
+	// One body at a time. The wide versions compute the same thing with the same operations.
+	B3_UNUSED( world );
+	B3_ASSERT( laneCount == 1 );
+	B3_UNUSED( laneCount );
+
+	b3Vec3 v = states->linearVelocity;
+	b3Vec3 w = states->angularVelocity;
+	b3Vec3 localOmega = b3InvRotateVector( sims->transform.q, w );
+	b3Vec3 localDeltaRotation = b3InvRotateVector( sims->transform.q, states->deltaRotation.v );
+	b3Quat q = b3NormalizeQuat( b3MulQuat( states->deltaRotation, sims->transform.q ) );
+
+	// Use the velocity of the farthest point on the body to account for rotation.
+	b3Vec3 velocityArc = b3ModifiedCross( b3Abs( localOmega ), sims->maxExtent );
+	float maxVelocity = b3Length( v ) + b3Length( velocityArc );
+
+	// Sleep needs to observe position correction as well as true velocity.
+	// q = [sin(theta/2) * v, cos(theta/2)]
+	// for small angles abs(theta) ~= 2 * length(sin(theta/2) * v)
+	b3Vec3 rotationArc = b3ModifiedCross( b3Abs( localDeltaRotation ), sims->maxExtent );
+	float maxDeltaPosition = b3Length( states->deltaPosition ) + 2.0f * b3Length( rotationArc );
+
+	// Position correction is not as important for sleep as true velocity.
+	float positionSleepFactor = 0.5f;
+	float sleepVelocity = b3MaxFloat( maxVelocity, positionSleepFactor * invTimeStep * maxDeltaPosition );
+
+	b3Vec3 rotatedCenter = b3RotateVector( q, sims->localCenter );
+
+	// Update world space inverse inertia tensor.
+	b3Matrix3 rotationMatrix = b3MakeMatrixFromQuat( q );
+	b3Matrix3 invInertiaWorld = b3MulMM( b3MulMM( rotationMatrix, sims->invInertiaLocal ), b3Transpose( rotationMatrix ) );
+
+	lanes->qx[0] = q.v.x;
+	lanes->qy[0] = q.v.y;
+	lanes->qz[0] = q.v.z;
+	lanes->qs[0] = q.s;
+	lanes->centerX[0] = rotatedCenter.x;
+	lanes->centerY[0] = rotatedCenter.y;
+	lanes->centerZ[0] = rotatedCenter.z;
+	lanes->invInertia[0][0] = invInertiaWorld.cx.x;
+	lanes->invInertia[1][0] = invInertiaWorld.cx.y;
+	lanes->invInertia[2][0] = invInertiaWorld.cx.z;
+	lanes->invInertia[3][0] = invInertiaWorld.cy.x;
+	lanes->invInertia[4][0] = invInertiaWorld.cy.y;
+	lanes->invInertia[5][0] = invInertiaWorld.cy.z;
+	lanes->invInertia[6][0] = invInertiaWorld.cz.x;
+	lanes->invInertia[7][0] = invInertiaWorld.cz.y;
+	lanes->invInertia[8][0] = invInertiaWorld.cz.z;
+	lanes->maxVelocity[0] = maxVelocity;
+	lanes->maxDeltaPosition[0] = maxDeltaPosition;
+	lanes->sleepVelocity[0] = sleepVelocity;
+#endif
+}
+
+// Bodies are finalized in groups. The math of a group is done first, several bodies at a time where SIMD
+// is available, and then each body of the group is updated in order with those results.
 static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex, void* context )
 {
 	b3TracyCZoneNC( finalize_bodies, "Finalize", b3_colorMediumSeaGreen, true );
@@ -716,15 +856,27 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 
 	const float speculativeScalar = B3_SPECULATIVE_DISTANCE;
 
-	for ( int simIndex = startIndex; simIndex < endIndex; ++simIndex )
+#if B3_WIDE_INTEGRATION
+	int groupSize = world->simdWidth == 8 ? 8 : 4;
+#else
+	int groupSize = 1;
+#endif
+
+	b3FinalizeLanes lanes;
+
+	for ( int groupIndex = startIndex; groupIndex < endIndex; groupIndex += groupSize )
 	{
+	int laneCount = b3MinInt( groupSize, endIndex - groupIndex );
+	b3FinalizeBodyMath( world, sims + groupIndex, states + groupIndex, laneCount, invTimeStep, &lanes );
+
+	for ( int lane = 0; lane < laneCount; ++lane )
+	{
+		int simIndex = groupIndex + lane;
 		b3BodyState* state = states + simIndex;
 		b3BodySim* sim = sims + simIndex;
 
 		b3Vec3 v = state->linearVelocity;
 		b3Vec3 w = state->angularVelocity;
-		b3Vec3 localOmega = b3InvRotateVector( sim->transform.q, w );
-		b3Vec3 localDeltaRotation = b3InvRotateVector( sim->transform.q, state->deltaRotation.v );
 
 		if ( b3IsValidVec3( v ) == false || b3IsValidVec3( w ) == false )
 		{
@@ -736,27 +888,18 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 		B3_ASSERT( b3IsValidVec3( w ) );
 
 		sim->center = b3OffsetPos( sim->center, state->deltaPosition );
-		sim->transform.q = b3NormalizeQuat( b3MulQuat( state->deltaRotation, sim->transform.q ) );
+		sim->transform.q = (b3Quat){ { lanes.qx[lane], lanes.qy[lane], lanes.qz[lane] }, lanes.qs[lane] };
 
-		// Use the velocity of the farthest point on the body to account for rotation.
-		b3Vec3 velocityArc = b3ModifiedCross( b3Abs( localOmega ), sim->maxExtent );
-		float maxVelocity = b3Length( v ) + b3Length( velocityArc );
-
-		// Sleep needs to observe position correction as well as true velocity.
-		// q = [sin(theta/2) * v, cos(theta/2)]
-		// for small angles abs(theta) ~= 2 * length(sin(theta/2) * v)
-		b3Vec3 rotationArc = b3ModifiedCross( b3Abs( localDeltaRotation ), sim->maxExtent );
-		float maxDeltaPosition = b3Length( state->deltaPosition ) + 2.0f * b3Length( rotationArc );
-
-		// Position correction is not as important for sleep as true velocity.
-		float positionSleepFactor = 0.5f;
-		float sleepVelocity = b3MaxFloat( maxVelocity, positionSleepFactor * invTimeStep * maxDeltaPosition );
+		float maxVelocity = lanes.maxVelocity[lane];
+		float maxDeltaPosition = lanes.maxDeltaPosition[lane];
+		float sleepVelocity = lanes.sleepVelocity[lane];
 
 		// reset state deltas
 		state->deltaPosition = b3Vec3_zero;
 		state->deltaRotation = b3Quat_identity;
 
-		sim->transform.p = b3OffsetPos( sim->center, b3Neg( b3RotateVector( sim->transform.q, sim->localCenter ) ) );
+		b3Vec3 rotatedCenter = { lanes.centerX[lane], lanes.centerY[lane], lanes.centerZ[lane] };
+		sim->transform.p = b3OffsetPos( sim->center, b3Neg( rotatedCenter ) );
 
 		// cache miss here, however I need the shape list below
 		b3Body* body = bodies + sim->bodyId;
@@ -785,6 +928,9 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 		body->flags |= ( state->flags & b3_isSpeedCapped );
 		state->flags &= ~b3_bodyTransientFlags;
 
+		// Continuous collision can move the body back to a time of impact
+		bool solvedContinuous = false;
+
 		if ( enableSleep == false || ( body->flags & b3_enableSleep ) == 0 || sleepVelocity > body->sleepThreshold )
 		{
 			// Body is not sleepy
@@ -807,6 +953,7 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 				else
 				{
 					b3SolveContinuous( world, simIndex, taskContext, timeStep );
+					solvedContinuous = true;
 				}
 			}
 			else
@@ -825,8 +972,20 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 		}
 
 		// Update world space inverse inertia tensor.
-		b3Matrix3 rotationMatrix = b3MakeMatrixFromQuat( sim->transform.q );
-		sim->invInertiaWorld = b3MulMM( b3MulMM( rotationMatrix, sim->invInertiaLocal ), b3Transpose( rotationMatrix ) );
+		if ( solvedContinuous )
+		{
+			// The rotation may no longer be the one the group math used
+			b3Matrix3 rotationMatrix = b3MakeMatrixFromQuat( sim->transform.q );
+			sim->invInertiaWorld = b3MulMM( b3MulMM( rotationMatrix, sim->invInertiaLocal ), b3Transpose( rotationMatrix ) );
+		}
+		else
+		{
+			sim->invInertiaWorld = (b3Matrix3){
+				{ lanes.invInertia[0][lane], lanes.invInertia[1][lane], lanes.invInertia[2][lane] },
+				{ lanes.invInertia[3][lane], lanes.invInertia[4][lane], lanes.invInertia[5][lane] },
+				{ lanes.invInertia[6][lane], lanes.invInertia[7][lane], lanes.invInertia[8][lane] },
+			};
+		}
 
 		// Any single body in an island can keep it awake
 		b3Island* island = b3Array_Get( world->islands, body->islandId );
@@ -871,11 +1030,15 @@ static void b3FinalizeBodiesTask( int startIndex, int endIndex, int workerIndex,
 
 					// Mark the hierarchy as moved using atomic operations.
 					b3BroadPhase_MarkProxyMoved( &world->broadPhase, shape->proxyKey, *shapeFatAABB );
+
+					// Contacts of this body may no longer have overlapping bounds, so they cannot be skipped
+					b3BumpBodyEpoch( world, sim->bodyId );
 				}
 
 				shapeId = shape->nextShapeId;
 			}
 		}
+	}
 	}
 
 	b3TracyCZoneEnd( finalize_bodies );
@@ -995,6 +1158,10 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 			b3PrepareJointsTask( block, context );
 			break;
 
+		case b3_stagePrepareWideJoints:
+			b3PrepareWideJoints( block, context );
+			break;
+
 		case b3_stagePrepareWideContacts:
 			b3PrepareContacts_Convex( block, context );
 			break;
@@ -1003,14 +1170,32 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 			b3PrepareContacts_MeshWide( block, context );
 			break;
 
+		case b3_stagePrepareIntegration:
+#if B3_WIDE_INTEGRATION
+			b3PrepareIntegration( block, context );
+#endif
+			break;
+
 		case b3_stageIntegrateVelocities:
+#if B3_WIDE_INTEGRATION
+			b3IntegrateVelocities( block, context );
+#else
 			b3IntegrateVelocitiesTask( block, context );
+#endif
 			break;
 
 		case b3_stageWarmStart:
 			if ( blockType == b3_graphJointBlock )
 			{
 				b3WarmStartJointsTask( block, context );
+			}
+			else if ( blockType == b3_graphSphericalBlock )
+			{
+				b3WarmStartSphericalJoints( block, context );
+			}
+			else if ( blockType == b3_graphRevoluteBlock )
+			{
+				b3WarmStartRevoluteJoints( block, context );
 			}
 			else if ( blockType == b3_graphWideContactBlock )
 			{
@@ -1028,6 +1213,16 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 				bool useBias = true;
 				b3SolveJointsTask( block, context, useBias, workerIndex );
 			}
+			else if ( blockType == b3_graphSphericalBlock )
+			{
+				bool useBias = true;
+				b3SolveSphericalJoints( block, context, useBias, workerIndex );
+			}
+			else if ( blockType == b3_graphRevoluteBlock )
+			{
+				bool useBias = true;
+				b3SolveRevoluteJoints( block, context, useBias, workerIndex );
+			}
 			else if ( blockType == b3_graphWideContactBlock )
 			{
 				b3PushContacts_Convex( block, context );
@@ -1039,7 +1234,11 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 			break;
 
 		case b3_stageIntegratePositions:
+#if B3_WIDE_INTEGRATION
+			b3IntegratePositions( block, context );
+#else
 			b3IntegratePositionsTask( block, context );
+#endif
 			break;
 
 		case b3_stageRelax:
@@ -1047,6 +1246,16 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 			{
 				bool useBias = false;
 				b3SolveJointsTask( block, context, useBias, workerIndex );
+			}
+			else if ( blockType == b3_graphSphericalBlock )
+			{
+				bool useBias = false;
+				b3SolveSphericalJoints( block, context, useBias, workerIndex );
+			}
+			else if ( blockType == b3_graphRevoluteBlock )
+			{
+				bool useBias = false;
+				b3SolveRevoluteJoints( block, context, useBias, workerIndex );
 			}
 			else if ( blockType == b3_graphWideContactBlock )
 			{
@@ -1067,6 +1276,10 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 			{
 				b3ApplyRestitution_MeshWide( block, context );
 			}
+			break;
+
+		case b3_stageStoreWideJoints:
+			b3StoreWideJoints( block, context );
 			break;
 
 		case b3_stageStoreWideImpulses:
@@ -1224,6 +1437,14 @@ static void b3SolverTask( void* taskContext )
 		stageIndex += 1;
 		jointSyncIndex += 1;
 
+		// Transpose the prepared spherical and revolute joints into wide joints
+		uint32_t wideJointSyncIndex = 1;
+		syncBits = ( wideJointSyncIndex << 16 ) | stageIndex;
+		B3_ASSERT( stages[stageIndex].type == b3_stagePrepareWideJoints );
+		b3ExecuteMainStage( stages + stageIndex, context, syncBits );
+		stageIndex += 1;
+		wideJointSyncIndex += 1;
+
 		// Prepare convex contact constraints
 		uint32_t convexSyncIndex = 1;
 		syncBits = ( convexSyncIndex << 16 ) | stageIndex;
@@ -1239,6 +1460,13 @@ static void b3SolverTask( void* taskContext )
 		b3ExecuteMainStage( stages + stageIndex, context, syncBits );
 		stageIndex += 1;
 		meshSyncIndex += 1;
+
+		// Reduce the body sims to what integration needs each sub-step
+		syncBits = ( bodySyncIndex << 16 ) | stageIndex;
+		B3_ASSERT( stages[stageIndex].type == b3_stagePrepareIntegration );
+		b3ExecuteMainStage( stages + stageIndex, context, syncBits );
+		stageIndex += 1;
+		bodySyncIndex += 1;
 
 		// Single-threaded overflow work. These constraints don't fit in the graph coloring.
 		b3PrepareJoints_Overflow( context );
@@ -1356,6 +1584,11 @@ static void b3SolverTask( void* taskContext )
 
 		// Store impulses
 		b3StoreImpulses_Overflow( context );
+
+		syncBits = ( wideJointSyncIndex << 16 ) | stageIndex;
+		B3_ASSERT( stages[stageIndex].type == b3_stageStoreWideJoints );
+		b3ExecuteMainStage( stages + stageIndex, context, syncBits );
+		stageIndex += 1;
 
 		syncBits = ( convexSyncIndex << 16 ) | stageIndex;
 		B3_ASSERT( stages[stageIndex].type == b3_stageStoreWideImpulses );
@@ -1501,8 +1734,14 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		int minBodiesPerBlock = 32;
 		b3BlockDim bodyDim = b3ComputeBlockCount( awakeBodyCount, minBodiesPerBlock, maxBlockCount );
 
+		// Wide integration works on groups of bodies, so every block must start on a group boundary.
+		// A multiple of 8 works for both SIMD widths.
+		bodyDim.size = ( bodyDim.size + 7 ) & ~7;
+		bodyDim.count = ( awakeBodyCount + bodyDim.size - 1 ) / bodyDim.size;
+
 		const int minContactsPerBlock = 4;
 		const int minJointsPerBlock = 4;
+		const int minWideJointsPerBlock = 1;
 
 		// Configure blocks for tasks parallel-for each active graph color
 		// The blocks are a mix of convex contact, mesh contact, and joint blocks
@@ -1510,10 +1749,14 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		int colorWideContactCounts[B3_GRAPH_COLOR_COUNT];
 		int colorMeshContactCounts[B3_GRAPH_COLOR_COUNT];
 		int colorMeshGroupCounts[B3_GRAPH_COLOR_COUNT];
-		int colorJointCounts[B3_GRAPH_COLOR_COUNT];
+		int colorScalarJointCounts[B3_GRAPH_COLOR_COUNT];
+		int colorSphericalCounts[B3_GRAPH_COLOR_COUNT];
+		int colorRevoluteCounts[B3_GRAPH_COLOR_COUNT];
 		b3BlockDim graphWideContactDims[B3_GRAPH_COLOR_COUNT];
 		b3BlockDim graphMeshContactDims[B3_GRAPH_COLOR_COUNT];
 		b3BlockDim graphJointDims[B3_GRAPH_COLOR_COUNT];
+		b3BlockDim graphSphericalDims[B3_GRAPH_COLOR_COUNT];
+		b3BlockDim graphRevoluteDims[B3_GRAPH_COLOR_COUNT];
 		int graphBlockCount = 0;
 
 		// c is the active color index
@@ -1521,6 +1764,8 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		int meshContactCount = 0;
 		int meshGroupCount = 0;
 		int jointCount = 0;
+		int wideSphericalCount = 0;
+		int wideRevoluteCount = 0;
 		int c = 0;
 		for ( int i = 0; i < B3_GRAPH_COLOR_COUNT - 1; ++i )
 		{
@@ -1529,12 +1774,30 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			int colorMeshContactCount = color->contacts.count;
 			int colorJointCount = color->jointSims.count;
 
+			color->wideSphericalJoints = NULL;
+			color->wideSphericalCount = 0;
+			color->wideRevoluteJoints = NULL;
+			color->wideRevoluteCount = 0;
+
 			if ( colorConvexContactCount + colorMeshContactCount + colorJointCount == 0 )
 			{
 				continue;
 			}
 
 			activeColorIndices[c] = i;
+
+			// Spherical and revolute joints are solved in groups with one joint per SIMD lane. The last
+			// group of each type may have unused lanes. The other joints are solved one at a time.
+			b3UpdateJointLayout( color );
+			int colorSphericalCount =
+				color->sphericalJoints.count > 0 ? ( ( color->sphericalJoints.count - 1 ) >> simdShift ) + 1 : 0;
+			int colorRevoluteCount =
+				color->revoluteJoints.count > 0 ? ( ( color->revoluteJoints.count - 1 ) >> simdShift ) + 1 : 0;
+			colorSphericalCounts[c] = colorSphericalCount;
+			colorRevoluteCounts[c] = colorRevoluteCount;
+			colorScalarJointCounts[c] = color->scalarSolveCount;
+			wideSphericalCount += colorSphericalCount;
+			wideRevoluteCount += colorRevoluteCount;
 
 			// Ceiling for wide constraint count
 			int colorWideConstraintCount = colorConvexContactCount > 0 ? ( ( colorConvexContactCount - 1 ) >> simdShift ) + 1 : 0;
@@ -1548,14 +1811,17 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			colorMeshGroupCounts[c] = colorMeshGroupCount;
 			meshGroupCount += colorMeshGroupCount;
 
-			colorJointCounts[c] = colorJointCount;
-			jointCount += colorJointCount;
+			// The joints that are prepared one at a time. The wide joints are prepared as they are gathered.
+			jointCount += color->scalarJoints.count;
 
 			// Solver block dimensions
 			graphWideContactDims[c] = b3ComputeBlockCount( colorWideConstraintCount, minContactsPerBlock, maxBlockCount );
 			graphMeshContactDims[c] = b3ComputeBlockCount( colorMeshGroupCount, minContactsPerBlock, maxBlockCount );
-			graphJointDims[c] = b3ComputeBlockCount( colorJointCount, minJointsPerBlock, maxBlockCount );
-			graphBlockCount += graphWideContactDims[c].count + graphMeshContactDims[c].count + graphJointDims[c].count;
+			graphJointDims[c] = b3ComputeBlockCount( colorScalarJointCounts[c], minJointsPerBlock, maxBlockCount );
+			graphSphericalDims[c] = b3ComputeBlockCount( colorSphericalCount, minWideJointsPerBlock, maxBlockCount );
+			graphRevoluteDims[c] = b3ComputeBlockCount( colorRevoluteCount, minWideJointsPerBlock, maxBlockCount );
+			graphBlockCount += graphWideContactDims[c].count + graphMeshContactDims[c].count + graphJointDims[c].count +
+							   graphSphericalDims[c].count + graphRevoluteDims[c].count;
 
 			c += 1;
 		}
@@ -1567,6 +1833,72 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3BlockDim convexPrepareDim = b3ComputeBlockCount( wideContactCount, minContactsPerBlock, maxBlockCount );
 		b3BlockDim meshPrepareDim = b3ComputeBlockCount( meshGroupCount, minContactsPerBlock, maxBlockCount );
 		b3BlockDim jointPrepareDim = b3ComputeBlockCount( jointCount, minJointsPerBlock, maxBlockCount );
+
+		// Per step constants for wide body integration
+		void* wideIntegrateData = NULL;
+#if B3_WIDE_INTEGRATION
+		{
+			int groupCount = ( ( awakeBodyCount - 1 ) >> simdShift ) + 1;
+			wideIntegrateData =
+				b3StackAlloc( &world->stack, groupCount * b3GetIntegrateDataByteCount( world->simdWidth ), "integrate data" );
+		}
+#endif
+
+		// Wide joints of all colors in two flat arrays, with the joints of each lane alongside
+		int wideJointCount = wideSphericalCount + wideRevoluteCount;
+		b3BlockDim wideJointDim = b3ComputeBlockCount( wideJointCount, minWideJointsPerBlock, maxBlockCount );
+		int wideSphericalByteCount = b3GetWideSphericalJointByteCount( world->simdWidth );
+		int wideRevoluteByteCount = b3GetWideRevoluteJointByteCount( world->simdWidth );
+		void* wideSphericalJoints = b3StackAlloc( &world->stack, wideSphericalCount * wideSphericalByteCount, "wide spherical" );
+		void* wideRevoluteJoints = b3StackAlloc( &world->stack, wideRevoluteCount * wideRevoluteByteCount, "wide revolute" );
+		b3JointSim** wideJointSims =
+			b3StackAlloc( &world->stack, ( wideJointCount << simdShift ) * sizeof( b3JointSim* ), "wide joint sims" );
+
+		{
+			int simdWidth = 1 << simdShift;
+			int sphericalBase = 0;
+			int revoluteBase = 0;
+			for ( int i = 0; i < activeColorCount; ++i )
+			{
+				b3GraphColor* color = colors + activeColorIndices[i];
+				b3JointSim* joints = color->jointSims.data;
+
+				if ( colorSphericalCounts[i] > 0 )
+				{
+					color->wideSphericalJoints = (uint8_t*)wideSphericalJoints + sphericalBase * wideSphericalByteCount;
+					color->wideSphericalCount = colorSphericalCounts[i];
+
+					const int* indices = color->sphericalJoints.data;
+					int count = color->sphericalJoints.count;
+					b3JointSim** lanes = wideJointSims + ( sphericalBase << simdShift );
+					for ( int j = 0; j < colorSphericalCounts[i] * simdWidth; ++j )
+					{
+						lanes[j] = j < count ? joints + indices[j] : NULL;
+					}
+
+					sphericalBase += colorSphericalCounts[i];
+				}
+
+				if ( colorRevoluteCounts[i] > 0 )
+				{
+					color->wideRevoluteJoints = (uint8_t*)wideRevoluteJoints + revoluteBase * wideRevoluteByteCount;
+					color->wideRevoluteCount = colorRevoluteCounts[i];
+
+					const int* indices = color->revoluteJoints.data;
+					int count = color->revoluteJoints.count;
+					b3JointSim** lanes = wideJointSims + ( ( wideSphericalCount + revoluteBase ) << simdShift );
+					for ( int j = 0; j < colorRevoluteCounts[i] * simdWidth; ++j )
+					{
+						lanes[j] = j < count ? joints + indices[j] : NULL;
+					}
+
+					revoluteBase += colorRevoluteCounts[i];
+				}
+			}
+
+			B3_ASSERT( sphericalBase == wideSphericalCount );
+			B3_ASSERT( revoluteBase == wideRevoluteCount );
+		}
 
 		int wideContactByteCount = b3GetWideContactConstraintByteCount( world->simdWidth );
 		void* wideConstraints = b3StackAlloc( &world->stack, wideContactCount * wideContactByteCount, "wide contacts" );
@@ -1729,9 +2061,10 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 				}
 
 				jointPrepareSpans[i].start = jointBase;
-				jointPrepareSpans[i].count = color->jointSims.count;
+				jointPrepareSpans[i].count = color->scalarJoints.count;
 				jointPrepareSpans[i].joints = color->jointSims.data;
-				jointBase += color->jointSims.count;
+				jointPrepareSpans[i].indices = color->scalarJoints.data;
+				jointBase += color->scalarJoints.count;
 			}
 
 			// Sentinels
@@ -1750,6 +2083,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			jointPrepareSpans[activeColorCount].start = jointCount;
 			jointPrepareSpans[activeColorCount].count = 0;
 			jointPrepareSpans[activeColorCount].joints = NULL;
+			jointPrepareSpans[activeColorCount].indices = NULL;
 			B3_ASSERT( jointBase == jointCount );
 		}
 
@@ -1766,9 +2100,13 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 
 		// b3_stagePrepareJoints
 		stageCount += 1;
+		// b3_stagePrepareWideJoints
+		stageCount += 1;
 		// b3_stagePrepareWideContacts
 		stageCount += 1;
 		// b3_stagePrepareContacts
+		stageCount += 1;
+		// b3_stagePrepareIntegration
 		stageCount += 1;
 		// b3_stageIntegrateVelocities
 		stageCount += 1;
@@ -1782,6 +2120,8 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		stageCount += RELAX_ITERATIONS * activeColorCount;
 		// b3_stageRestitution
 		stageCount += activeColorCount;
+		// b3_stageStoreWideJoints
+		stageCount += 1;
 		// b3_stageStoreWideImpulses
 		stageCount += 1;
 		// b3_stageStoreImpulses
@@ -1793,6 +2133,8 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			b3StackAlloc( &world->stack, convexPrepareDim.count * sizeof( b3SyncBlock ), "convex blocks" );
 		b3SyncBlock* meshBlocks = b3StackAlloc( &world->stack, meshPrepareDim.count * sizeof( b3SyncBlock ), "mesh blocks" );
 		b3SyncBlock* jointBlocks = b3StackAlloc( &world->stack, jointPrepareDim.count * sizeof( b3SyncBlock ), "joint blocks" );
+		b3SyncBlock* wideJointBlocks =
+			b3StackAlloc( &world->stack, wideJointDim.count * sizeof( b3SyncBlock ), "wide joint blocks" );
 		b3SyncBlock* graphBlocks = b3StackAlloc( &world->stack, graphBlockCount * sizeof( b3SyncBlock ), "graph blocks" );
 
 		// Split an awake island. This modifies:
@@ -1824,6 +2166,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3InitBlocks( convexBlocks, convexPrepareDim, wideContactCount, b3_wideContactBlock, UINT8_MAX );
 		b3InitBlocks( meshBlocks, meshPrepareDim, meshGroupCount, b3_contactBlock, UINT8_MAX );
 		b3InitBlocks( jointBlocks, jointPrepareDim, jointCount, b3_jointBlock, UINT8_MAX );
+		b3InitBlocks( wideJointBlocks, wideJointDim, wideJointCount, b3_wideJointBlock, UINT8_MAX );
 
 		// Prepare graph work blocks. Each color gets joint blocks followed by contact blocks.
 		b3SyncBlock* graphColorBlocks[B3_GRAPH_COLOR_COUNT] = { 0 };
@@ -1834,8 +2177,14 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			graphColorBlocks[i] = baseGraphBlock;
 
 			uint8_t colorIndex = (uint8_t)activeColorIndices[i];
-			b3InitBlocks( baseGraphBlock, graphJointDims[i], colorJointCounts[i], b3_graphJointBlock, colorIndex );
+			b3InitBlocks( baseGraphBlock, graphJointDims[i], colorScalarJointCounts[i], b3_graphJointBlock, colorIndex );
 			baseGraphBlock += graphJointDims[i].count;
+
+			b3InitBlocks( baseGraphBlock, graphSphericalDims[i], colorSphericalCounts[i], b3_graphSphericalBlock, colorIndex );
+			baseGraphBlock += graphSphericalDims[i].count;
+
+			b3InitBlocks( baseGraphBlock, graphRevoluteDims[i], colorRevoluteCounts[i], b3_graphRevoluteBlock, colorIndex );
+			baseGraphBlock += graphRevoluteDims[i].count;
 
 			b3InitBlocks( baseGraphBlock, graphWideContactDims[i], colorWideContactCounts[i], b3_graphWideContactBlock,
 						  colorIndex );
@@ -1844,15 +2193,18 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			b3InitBlocks( baseGraphBlock, graphMeshContactDims[i], colorMeshGroupCounts[i], b3_graphContactBlock, colorIndex );
 			baseGraphBlock += graphMeshContactDims[i].count;
 
-			graphBlockCounts[i] = graphJointDims[i].count + graphWideContactDims[i].count + graphMeshContactDims[i].count;
+			graphBlockCounts[i] = graphJointDims[i].count + graphSphericalDims[i].count + graphRevoluteDims[i].count +
+								  graphWideContactDims[i].count + graphMeshContactDims[i].count;
 		}
 
 		B3_ASSERT( (ptrdiff_t)( baseGraphBlock - graphBlocks ) == graphBlockCount );
 
 		b3SolverStage* stage = stages;
 		stage = b3InitStage( stage, b3_stagePrepareJoints, jointBlocks, jointPrepareDim.count, UINT8_MAX );
+		stage = b3InitStage( stage, b3_stagePrepareWideJoints, wideJointBlocks, wideJointDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stagePrepareWideContacts, convexBlocks, convexPrepareDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stagePrepareContacts, meshBlocks, meshPrepareDim.count, UINT8_MAX );
+		stage = b3InitStage( stage, b3_stagePrepareIntegration, bodyBlocks, bodyDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stageIntegrateVelocities, bodyBlocks, bodyDim.count, UINT8_MAX );
 		stage = b3InitColorStages( stage, b3_stageWarmStart, 1, activeColorCount, graphColorBlocks, graphBlockCounts,
 								   activeColorIndices );
@@ -1863,6 +2215,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 								   activeColorIndices );
 		stage = b3InitColorStages( stage, b3_stageRestitution, 1, activeColorCount, graphColorBlocks, graphBlockCounts,
 								   activeColorIndices );
+		stage = b3InitStage( stage, b3_stageStoreWideJoints, wideJointBlocks, wideJointDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stageStoreWideImpulses, convexBlocks, convexPrepareDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stageStoreImpulses, meshBlocks, meshPrepareDim.count, UINT8_MAX );
 
@@ -1884,6 +2237,12 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		stepContext->wideMeshManifoldStarts = meshManifoldStarts;
 		stepContext->meshPrepareSpans = meshPrepareSpans;
 		stepContext->jointPrepareSpans = jointPrepareSpans;
+		stepContext->wideIntegrateData = wideIntegrateData;
+		stepContext->wideSphericalJoints = wideSphericalJoints;
+		stepContext->wideRevoluteJoints = wideRevoluteJoints;
+		stepContext->wideJointSims = wideJointSims;
+		stepContext->wideSphericalCount = wideSphericalCount;
+		stepContext->wideRevoluteCount = wideRevoluteCount;
 		b3AtomicStoreU32( &stepContext->atomicSyncBits, 0 );
 		b3AtomicStoreInt( &stepContext->mainClaimed, 0 );
 
@@ -1981,6 +2340,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 
 		// Free in reverse order
 		b3StackFree( &world->stack, graphBlocks );
+		b3StackFree( &world->stack, wideJointBlocks );
 		b3StackFree( &world->stack, jointBlocks );
 		b3StackFree( &world->stack, meshBlocks );
 		b3StackFree( &world->stack, convexBlocks );
@@ -1992,6 +2352,12 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3StackFree( &world->stack, meshManifoldStarts );
 		b3StackFree( &world->stack, meshLaneOrder );
 		b3StackFree( &world->stack, wideConstraints );
+		b3StackFree( &world->stack, wideJointSims );
+		b3StackFree( &world->stack, wideRevoluteJoints );
+		b3StackFree( &world->stack, wideSphericalJoints );
+#if B3_WIDE_INTEGRATION
+		b3StackFree( &world->stack, wideIntegrateData );
+#endif
 
 		world->profile.transforms = b3GetMilliseconds( transformTicks );
 		b3TracyCZoneEnd( update_transforms );

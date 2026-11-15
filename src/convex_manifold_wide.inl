@@ -219,6 +219,78 @@ static inline void b3GetFacePlaneSeparations( const b3HullData* hull, b3Vec3 oth
 	}
 }
 
+// Collect the edges of a hull that pass b3TestEdgeCandidateSorted, in order. Returns the count.
+// planeDots: the value of each face plane, the first two arguments of the test
+static inline int b3GatherEdgeCandidates( const b3HullData* hull, const float* planeDots, float bound, int* edgeIndices )
+{
+	const b3HullHalfEdge* halfEdges = b3GetHullEdges( hull );
+	const float* cosines = b3GetHullEdgeCosines( hull );
+	int halfEdgeCount = hull->edgeCount;
+	int count = 0;
+	int i = 0;
+
+#if B3_SIMD_WIDTH == 8
+	// Eight edges at a time. An edge is a pair of half edges and each half edge is four bytes with the
+	// face index in the last byte. This computes the same test as b3TestEdgeCandidateSorted with the
+	// same operations, so it keeps exactly the same edges.
+	_Static_assert( sizeof( b3HullHalfEdge ) == 4 && offsetof( b3HullHalfEdge, face ) == 3, "half edge layout" );
+
+	const __m256i evenThenOdd = _mm256_setr_epi32( 0, 2, 4, 6, 1, 3, 5, 7 );
+	const __m256 boundW = _mm256_set1_ps( bound );
+	const __m256 oneW = _mm256_set1_ps( 1.0f );
+	const __m256 zeroW = _mm256_setzero_ps();
+	const __m256 parallelTol = _mm256_set1_ps( B3_PARALLEL_TOL );
+
+	for ( ; i + 16 <= halfEdgeCount; i += 16 )
+	{
+		// Split the sixteen half edges into the first and the second half edge of each edge
+		__m256i h0 = _mm256_permutevar8x32_epi32( _mm256_loadu_si256( (const __m256i*)( halfEdges + i ) ), evenThenOdd );
+		__m256i h1 = _mm256_permutevar8x32_epi32( _mm256_loadu_si256( (const __m256i*)( halfEdges + i + 8 ) ), evenThenOdd );
+		__m256i face1 = _mm256_srli_epi32( _mm256_permute2x128_si256( h0, h1, 0x20 ), 24 );
+		__m256i face2 = _mm256_srli_epi32( _mm256_permute2x128_si256( h0, h1, 0x31 ), 24 );
+
+		__m256 a1 = _mm256_i32gather_ps( planeDots, face1, 4 );
+		__m256 a2 = _mm256_i32gather_ps( planeDots, face2, 4 );
+		__m256 c = _mm256_loadu_ps( cosines + ( i >> 1 ) );
+
+		// b3MaxFloat( a1, a2 ) and b3MinFloat( a1, a2 )
+		__m256 hi = _mm256_blendv_ps( a2, a1, _mm256_cmp_ps( a1, a2, _CMP_GT_OQ ) );
+		__m256 lo = _mm256_blendv_ps( a2, a1, _mm256_cmp_ps( a1, a2, _CMP_LT_OQ ) );
+		__m256 exterior = _mm256_cmp_ps( hi, boundW, _CMP_GE_OQ );
+
+		__m256 u = _mm256_sub_ps( lo, _mm256_mul_ps( c, hi ) );
+		__m256 maxIsInterior = _mm256_cmp_ps( u, zeroW, _CMP_GE_OQ );
+
+		__m256 s = _mm256_sub_ps( oneW, _mm256_mul_ps( c, c ) );
+		__m256 boundTerm = _mm256_mul_ps( _mm256_sub_ps( boundW, hi ), _mm256_add_ps( boundW, hi ) );
+		__m256 lhs = _mm256_mul_ps( u, u );
+		__m256 rhs = _mm256_mul_ps( boundTerm, s );
+		__m256 maxBeatsBound = _mm256_cmp_ps( lhs, rhs, _CMP_GE_OQ );
+		__m256 nearlyParallel = _mm256_cmp_ps( s, parallelTol, _CMP_LT_OQ );
+
+		__m256 keep = _mm256_or_ps( exterior, _mm256_and_ps( maxIsInterior, _mm256_or_ps( maxBeatsBound, nearlyParallel ) ) );
+		int keepMask = _mm256_movemask_ps( keep );
+
+		for ( int lane = 0; lane < 8; ++lane )
+		{
+			edgeIndices[count] = i + 2 * lane;
+			count += ( keepMask >> lane ) & 1;
+		}
+	}
+#endif
+
+	for ( ; i < halfEdgeCount; i += 2 )
+	{
+		int i1 = halfEdges[i].face;
+		int i2 = halfEdges[i + 1].face;
+		float c = cosines[i >> 1];
+		edgeIndices[count] = i;
+		count += b3TestEdgeCandidateSorted( planeDots[i1], planeDots[i2], c, bound );
+	}
+
+	return count;
+}
+
 // The number of edge pair tests needed to make the extra culling pass worthwhile.
 #define B3_EDGE_PROBE_MIN_TESTS 10
 
@@ -465,15 +537,11 @@ b3AxisQuery B3_WIDE( b3ComputeSeparatingAxis )( const b3HullData* hullA, const b
 				 centerDistance >= b3MaxFloat( res.faceA.separation, res.faceB.separation ) + radiusBound );
 
 	// Gather edges of A that can feasibly create a separating axis that beats the maximum face separation.
-	int halfEdgeCountA = hullA->edgeCount;
 	const b3HullHalfEdge* halfEdgesA = b3GetHullEdges( hullA );
 	int edgeIndicesA[NE];
-	int na = 0;
 
-	int halfEdgeCountB = hullB->edgeCount;
 	const b3HullHalfEdge* halfEdgesB = b3GetHullEdges( hullB );
 	int edgeIndicesB[B3_MAX_HULL_EDGES];
-	int nb = 0;
 
 	float maxFaceSeparation = b3MaxFloat( res.faceA.separation, res.faceB.separation );
 	float boundSlack = radius - radiusBound;
@@ -488,26 +556,8 @@ b3AxisQuery B3_WIDE( b3ComputeSeparatingAxis )( const b3HullData* hullA, const b
 	b3GetFacePlaneSeparations( hullA, centerBinA, planeDotA );
 	b3GetFacePlaneSeparations( hullB, centerAinB, planeDotB );
 
-	const float* cosinesA = b3GetHullEdgeCosines( hullA );
-	const float* cosinesB = b3GetHullEdgeCosines( hullB );
-
-	for ( int i = 0; i < halfEdgeCountA; i += 2 )
-	{
-		int i1 = halfEdgesA[i].face;
-		int i2 = halfEdgesA[i + 1].face;
-		float c = cosinesA[i >> 1];
-		edgeIndicesA[na] = i;
-		na += b3TestEdgeCandidateSorted( planeDotA[i1], planeDotA[i2], c, thresholdA );
-	}
-
-	for ( int i = 0; i < halfEdgeCountB; i += 2 )
-	{
-		int i1 = halfEdgesB[i].face;
-		int i2 = halfEdgesB[i + 1].face;
-		float c = cosinesB[i >> 1];
-		edgeIndicesB[nb] = i;
-		nb += b3TestEdgeCandidateSorted( planeDotB[i1], planeDotB[i2], c, thresholdB );
-	}
+	int na = b3GatherEdgeCandidates( hullA, planeDotA, thresholdA, edgeIndicesA );
+	int nb = b3GatherEdgeCandidates( hullB, planeDotB, thresholdB, edgeIndicesB );
 
 	// Apply additional culling use the support points for the best face axes.
 	// The support vertices of the best faces are points on the other hull, so an edge pair axis cannot
@@ -823,3 +873,209 @@ b3AxisQuery B3_WIDE( b3ComputeSeparatingAxis )( const b3HullData* hullA, const b
 #undef NE
 #undef NF
 #undef NV
+
+#if B3_SIMD_WIDTH == 8
+
+// The search of b3QueryTriangleAndHullEdges with eight hull edges per iteration: over all pairs of a hull
+// edge and a triangle edge, find the valid pair with the largest separation. The separations are computed
+// with the same operations as the scalar code, so this finds the same pair, including the scalar rule
+// that the first pair wins a tie. The caller computes the result for that pair with the scalar code.
+// Returns 4 * halfEdgeIndex + triangleEdgeIndex, or -1 if no pair is valid.
+// processedCount: the number of half edges covered, the caller continues from there
+int b3FindTriangleHullEdgePairW8( const b3Vec3* trianglePoints, const b3Vec3* triangleEdges, b3Vec3 triNormal,
+								  const b3HullData* hull, int* processedCount )
+{
+	_Static_assert( sizeof( b3HullHalfEdge ) == 4 && offsetof( b3HullHalfEdge, origin ) == 2 && offsetof( b3HullHalfEdge, face ) == 3,
+					"half edge layout" );
+	_Static_assert( sizeof( b3Vec3 ) == 12 && sizeof( b3Plane ) == 16 && offsetof( b3Plane, normal ) == 0, "hull data layout" );
+
+	const b3HullHalfEdge* hullEdges = b3GetHullEdges( hull );
+	const float* points = (const float*)b3GetHullPoints( hull );
+	const float* planes = (const float*)b3GetHullPlanes( hull );
+	int edgeCount = hull->edgeCount;
+	float squaredTolerance = 0.005f * 0.005f;
+
+	const __m256i evenThenOdd = _mm256_setr_epi32( 0, 2, 4, 6, 1, 3, 5, 7 );
+	const __m256i byteMask = _mm256_set1_epi32( 0xFF );
+	const __m256 zero = _mm256_setzero_ps();
+	const __m256 one = _mm256_set1_ps( 1.0f );
+	const __m256 minLengthSq = _mm256_set1_ps( 1000.0f * FLT_MIN );
+
+	// Per triangle edge constants
+	__m256 edgeX[3], edgeY[3], edgeZ[3], pointX[3], pointY[3], pointZ[3], tolerance[3];
+	for ( int j = 0; j < 3; ++j )
+	{
+		edgeX[j] = _mm256_set1_ps( triangleEdges[j].x );
+		edgeY[j] = _mm256_set1_ps( triangleEdges[j].y );
+		edgeZ[j] = _mm256_set1_ps( triangleEdges[j].z );
+		pointX[j] = _mm256_set1_ps( trianglePoints[j].x );
+		pointY[j] = _mm256_set1_ps( trianglePoints[j].y );
+		pointZ[j] = _mm256_set1_ps( trianglePoints[j].z );
+		tolerance[j] = _mm256_set1_ps( squaredTolerance * b3LengthSquared( triangleEdges[j] ) );
+	}
+
+	const __m256 normalX = _mm256_set1_ps( triNormal.x );
+	const __m256 normalY = _mm256_set1_ps( triNormal.y );
+	const __m256 normalZ = _mm256_set1_ps( triNormal.z );
+
+	__m256 bestSeparation = _mm256_set1_ps( -INFINITY );
+	__m256 bestCode = _mm256_set1_ps( -1.0f );
+
+	// The code of the pair in each lane for triangle edge 0 of the current group
+	__m256 code = _mm256_setr_ps( 0.0f, 8.0f, 16.0f, 24.0f, 32.0f, 40.0f, 48.0f, 56.0f );
+	const __m256 codeStep = _mm256_set1_ps( 64.0f );
+
+	int i = 0;
+	for ( ; i + 16 <= edgeCount; i += 16 )
+	{
+		// Split the sixteen half edges into the first and the second half edge of each edge
+		__m256i h0 = _mm256_permutevar8x32_epi32( _mm256_loadu_si256( (const __m256i*)( hullEdges + i ) ), evenThenOdd );
+		__m256i h1 = _mm256_permutevar8x32_epi32( _mm256_loadu_si256( (const __m256i*)( hullEdges + i + 8 ) ), evenThenOdd );
+		__m256i edge = _mm256_permute2x128_si256( h0, h1, 0x20 );
+		__m256i twin = _mm256_permute2x128_si256( h0, h1, 0x31 );
+
+		// Indices into the point and plane arrays, in floats
+		__m256i origin1 = _mm256_and_si256( _mm256_srli_epi32( edge, 16 ), byteMask );
+		__m256i origin2 = _mm256_and_si256( _mm256_srli_epi32( twin, 16 ), byteMask );
+		origin1 = _mm256_add_epi32( origin1, _mm256_slli_epi32( origin1, 1 ) );
+		origin2 = _mm256_add_epi32( origin2, _mm256_slli_epi32( origin2, 1 ) );
+		__m256i face1 = _mm256_slli_epi32( _mm256_srli_epi32( edge, 24 ), 2 );
+		__m256i face2 = _mm256_slli_epi32( _mm256_srli_epi32( twin, 24 ), 2 );
+
+		__m256 hullPointX = _mm256_i32gather_ps( points + 0, origin1, 4 );
+		__m256 hullPointY = _mm256_i32gather_ps( points + 1, origin1, 4 );
+		__m256 hullPointZ = _mm256_i32gather_ps( points + 2, origin1, 4 );
+
+		// hullEdge = b3Sub( hullPoints[twin->origin], hullPoint )
+		__m256 hullEdgeX = _mm256_sub_ps( _mm256_i32gather_ps( points + 0, origin2, 4 ), hullPointX );
+		__m256 hullEdgeY = _mm256_sub_ps( _mm256_i32gather_ps( points + 1, origin2, 4 ), hullPointY );
+		__m256 hullEdgeZ = _mm256_sub_ps( _mm256_i32gather_ps( points + 2, origin2, 4 ), hullPointZ );
+
+		__m256 normal1X = _mm256_i32gather_ps( planes + 0, face1, 4 );
+		__m256 normal1Y = _mm256_i32gather_ps( planes + 1, face1, 4 );
+		__m256 normal1Z = _mm256_i32gather_ps( planes + 2, face1, 4 );
+		__m256 normal2X = _mm256_i32gather_ps( planes + 0, face2, 4 );
+		__m256 normal2Y = _mm256_i32gather_ps( planes + 1, face2, 4 );
+		__m256 normal2Z = _mm256_i32gather_ps( planes + 2, face2, 4 );
+
+		// bcd = b3Dot( triNormal, hullEdge )
+		__m256 bcd = _mm256_add_ps( _mm256_add_ps( _mm256_mul_ps( normalX, hullEdgeX ), _mm256_mul_ps( normalY, hullEdgeY ) ),
+									_mm256_mul_ps( normalZ, hullEdgeZ ) );
+
+		for ( int j = 0; j < 3; ++j )
+		{
+			// cab = b3Dot( hullNormal1, triEdge ), dab = b3Dot( hullNormal2, triEdge )
+			__m256 cab = _mm256_add_ps( _mm256_add_ps( _mm256_mul_ps( normal1X, edgeX[j] ), _mm256_mul_ps( normal1Y, edgeY[j] ) ),
+										_mm256_mul_ps( normal1Z, edgeZ[j] ) );
+			__m256 dab = _mm256_add_ps( _mm256_add_ps( _mm256_mul_ps( normal2X, edgeX[j] ), _mm256_mul_ps( normal2Y, edgeY[j] ) ),
+										_mm256_mul_ps( normal2Z, edgeZ[j] ) );
+
+			// if ( cab * dab >= 0.0f || cab * bcd <= 0.0f ) continue
+			__m256 skip = _mm256_or_ps( _mm256_cmp_ps( _mm256_mul_ps( cab, dab ), zero, _CMP_GE_OQ ),
+										_mm256_cmp_ps( _mm256_mul_ps( cab, bcd ), zero, _CMP_LE_OQ ) );
+
+			// if ( b3MaxFloat( cab * cab, dab * dab ) < squaredTolerance * b3LengthSquared( triEdge ) ) continue
+			__m256 cabSq = _mm256_mul_ps( cab, cab );
+			__m256 dabSq = _mm256_mul_ps( dab, dab );
+			__m256 maxSq = _mm256_blendv_ps( dabSq, cabSq, _mm256_cmp_ps( cabSq, dabSq, _CMP_GT_OQ ) );
+			skip = _mm256_or_ps( skip, _mm256_cmp_ps( maxSq, tolerance[j], _CMP_LT_OQ ) );
+
+			// axis = b3Normalize( b3Lerp( hullNormal1, hullNormal2, cab / ( cab - dab ) ) )
+			__m256 t = _mm256_div_ps( cab, _mm256_sub_ps( cab, dab ) );
+			__m256 s = _mm256_sub_ps( one, t );
+			__m256 axisX = _mm256_add_ps( _mm256_mul_ps( s, normal1X ), _mm256_mul_ps( t, normal2X ) );
+			__m256 axisY = _mm256_add_ps( _mm256_mul_ps( s, normal1Y ), _mm256_mul_ps( t, normal2Y ) );
+			__m256 axisZ = _mm256_add_ps( _mm256_mul_ps( s, normal1Z ), _mm256_mul_ps( t, normal2Z ) );
+
+			__m256 lengthSq = _mm256_add_ps( _mm256_add_ps( _mm256_mul_ps( axisX, axisX ), _mm256_mul_ps( axisY, axisY ) ),
+											 _mm256_mul_ps( axisZ, axisZ ) );
+			__m256 canNormalize = _mm256_cmp_ps( lengthSq, minLengthSq, _CMP_GT_OQ );
+			__m256 scale = _mm256_div_ps( one, _mm256_sqrt_ps( lengthSq ) );
+			axisX = _mm256_and_ps( _mm256_mul_ps( scale, axisX ), canNormalize );
+			axisY = _mm256_and_ps( _mm256_mul_ps( scale, axisY ), canNormalize );
+			axisZ = _mm256_and_ps( _mm256_mul_ps( scale, axisZ ), canNormalize );
+
+			// separation = b3Dot( axis, b3Sub( trianglePoints[j], hullPoint ) )
+			__m256 separation =
+				_mm256_add_ps( _mm256_add_ps( _mm256_mul_ps( axisX, _mm256_sub_ps( pointX[j], hullPointX ) ),
+											  _mm256_mul_ps( axisY, _mm256_sub_ps( pointY[j], hullPointY ) ) ),
+							   _mm256_mul_ps( axisZ, _mm256_sub_ps( pointZ[j], hullPointZ ) ) );
+
+			// if ( separation > result.separation ) take this pair
+			__m256 take = _mm256_andnot_ps( skip, _mm256_cmp_ps( separation, bestSeparation, _CMP_GT_OQ ) );
+			bestSeparation = _mm256_blendv_ps( bestSeparation, separation, take );
+			bestCode = _mm256_blendv_ps( bestCode, _mm256_add_ps( code, _mm256_set1_ps( (float)j ) ), take );
+		}
+
+		code = _mm256_add_ps( code, codeStep );
+	}
+
+	*processedCount = i;
+
+	// Each lane holds its largest separation and the first pair that reached it. Take the largest
+	// across the lanes and then the first pair among the lanes that have it.
+	__m128 max4 = _mm_max_ps( _mm256_castps256_ps128( bestSeparation ), _mm256_extractf128_ps( bestSeparation, 1 ) );
+	__m128 max2 = _mm_max_ps( max4, _mm_movehl_ps( max4, max4 ) );
+	__m128 max1 = _mm_max_ss( max2, _mm_shuffle_ps( max2, max2, 1 ) );
+	__m256 isBest = _mm256_cmp_ps( bestSeparation, _mm256_broadcastss_ps( max1 ), _CMP_EQ_OQ );
+
+	// A lane without a valid pair has the code -1, which must not win
+	isBest = _mm256_and_ps( isBest, _mm256_cmp_ps( bestCode, zero, _CMP_GE_OQ ) );
+	__m256 candidates = _mm256_blendv_ps( _mm256_set1_ps( FLT_MAX ), bestCode, isBest );
+	__m128 code4 = _mm_min_ps( _mm256_castps256_ps128( candidates ), _mm256_extractf128_ps( candidates, 1 ) );
+	__m128 code2 = _mm_min_ps( code4, _mm_movehl_ps( code4, code4 ) );
+	__m128 code1 = _mm_min_ss( code2, _mm_shuffle_ps( code2, code2, 1 ) );
+
+	float best = _mm_cvtss_f32( code1 );
+	return best == FLT_MAX ? -1 : (int)best;
+}
+
+// b3FindHullSupportVertex with eight vertices per iteration. Returns the same vertex: the one with
+// the largest dot product and, among equals, the lowest index. The vertex arrays are padded to a
+// multiple of eight with copies of the first vertex, which lose every tie because of their higher index.
+int b3FindHullSupportVertexW8( const b3HullData* hull, b3Vec3 direction )
+{
+	int vertexCount = hull->vertexCount;
+	const float* vx = b3GetHullSoaVertices( hull );
+
+	int soaVertexCount = b3GetHullSoaStride( vertexCount );
+	const float* vy = vx + soaVertexCount;
+	const float* vz = vy + soaVertexCount;
+
+	b3FloatW dx = b3SplatW( direction.x );
+	b3FloatW dy = b3SplatW( direction.y );
+	b3FloatW dz = b3SplatW( direction.z );
+	b3FloatW eight = b3SplatW( 8.0f );
+	b3FloatW index = b3SetW( 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f );
+	b3FloatW bestDotW = b3SplatW( -FLT_MAX );
+	b3FloatW bestIndexW = b3SplatW( -1.0f );
+
+	int loopCount = b3RoundUpToSIMDWidth( vertexCount );
+	for ( int i = 0; i < loopCount; i += 8 )
+	{
+		b3FloatW dot = b3AddW( b3AddW( b3MulW( dx, b3LoadW( vx + i ) ), b3MulW( dy, b3LoadW( vy + i ) ) ), b3MulW( dz, b3LoadW( vz + i ) ) );
+		b3FloatW mask = b3GreaterThanW( dot, bestDotW );
+		bestDotW = b3BlendW( bestDotW, dot, mask );
+		bestIndexW = b3BlendW( bestIndexW, index, mask );
+		index = b3AddW( index, eight );
+	}
+
+	// Each lane holds its largest dot product and the first index that reached it. Take the largest
+	// across the lanes and then the lowest index among the lanes that have it.
+	__m128 dot4 = _mm_max_ps( _mm256_castps256_ps128( bestDotW ), _mm256_extractf128_ps( bestDotW, 1 ) );
+	__m128 dot2 = _mm_max_ps( dot4, _mm_movehl_ps( dot4, dot4 ) );
+	__m128 dot1 = _mm_max_ss( dot2, _mm_shuffle_ps( dot2, dot2, 1 ) );
+	__m256 bestDot = _mm256_broadcastss_ps( dot1 );
+
+	__m256 isBest = _mm256_cmp_ps( bestDotW, bestDot, _CMP_EQ_OQ );
+	__m256 candidates = _mm256_blendv_ps( _mm256_set1_ps( FLT_MAX ), bestIndexW, isBest );
+	__m128 index4 = _mm_min_ps( _mm256_castps256_ps128( candidates ), _mm256_extractf128_ps( candidates, 1 ) );
+	__m128 index2 = _mm_min_ps( index4, _mm_movehl_ps( index4, index4 ) );
+	__m128 index1 = _mm_min_ss( index2, _mm_shuffle_ps( index2, index2, 1 ) );
+
+	int bestIndex = _mm_cvttss_si32( index1 );
+	B3_ASSERT( 0 <= bestIndex && bestIndex < vertexCount );
+	return bestIndex;
+}
+
+#endif

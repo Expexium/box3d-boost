@@ -46,6 +46,25 @@ typedef struct b3GraphColor
 	// cache friendly arrays
 	b3Array( b3JointSim ) jointSims;
 
+	// Joint solver layout. Spherical and revolute joints are solved several at a time with SIMD, which
+	// needs them grouped by type. The joints in a color are independent, so they can be solved in any
+	// order. These hold indices into jointSims and are rebuilt by b3UpdateJointLayout when the joints
+	// of this color change. Unused on the overflow color.
+	b3Array( int ) sphericalJoints;
+	b3Array( int ) revoluteJoints;
+
+	// The remaining joints are prepared and solved one at a time. The first scalarSolveCount of these
+	// need solving. Filter joints come after that because they have nothing to solve.
+	b3Array( int ) scalarJoints;
+	int scalarSolveCount;
+	bool jointLayoutDirty;
+
+	// Wide joint constraints for the current time step, see joint_solver_wide.inl
+	void* wideSphericalJoints;
+	int wideSphericalCount;
+	void* wideRevoluteJoints;
+	int wideRevoluteCount;
+
 	b3Array( int ) convexContacts;
 	b3Array( b3ContactSpec ) contacts;
 
@@ -73,6 +92,9 @@ void b3DestroyGraph( b3ConstraintGraph* graph );
 
 void b3AddContactToGraph( b3World* world, b3Contact* contact );
 void b3RemoveContactFromGraph( b3World* world, int bodyIdA, int bodyIdB, int colorIndex, int localIndex, bool meshContact );
+
+// Rebuild the joint solver layout of a color if its joints changed
+void b3UpdateJointLayout( b3GraphColor* color );
 
 b3JointSim* b3CreateJointInGraph( b3World* world, b3Joint* joint );
 void b3AddJointToGraph( b3World* world, b3JointSim* jointSim, b3Joint* joint );

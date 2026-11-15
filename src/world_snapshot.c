@@ -481,6 +481,10 @@ static void b3DesGraphColor( b3SnapReader* r, b3GraphColor* color, bool isOverfl
 	b3DesPodArray( r, color->jointSims );
 	b3DesPodArray( r, color->convexContacts );
 	b3DesPodArray( r, color->contacts );
+
+	// The joint solver layout is not part of the image
+	color->jointLayoutDirty = true;
+
 	// Transient pointers left at NULL/0 from shell
 }
 
@@ -1187,6 +1191,15 @@ bool b3DeserializeIntoShell( const uint8_t* data, int size, b3World* world, b3Re
 
 	// Free existing per-object heap before overwriting
 	b3FreeLiveSimElements( world );
+
+	// The contact skip cache is not part of the image. It is rebuilt by the narrow phase.
+	world->bodyEpochs.count = 0;
+	world->bodyMotionMasks.count = 0;
+	world->bodyQuatWindows.count = 0;
+	world->bodyMotionRefs.count = 0;
+	world->skipBodyCount = 0;
+	world->contactSkips.count = 0;
+	world->contactRefreshFlags.count = 0;
 
 	// 1. World scalars
 	b3DesWorldConfig( r, world );

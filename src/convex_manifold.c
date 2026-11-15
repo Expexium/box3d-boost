@@ -1268,6 +1268,104 @@ b3AxisQuery b3ComputeSeparatingAxis( const b3HullData* hullA, const b3HullData* 
 	return b3ComputeSeparatingAxisAtWidth( hullA, hullB, xfB, earlyReturn, b3GetSIMDWidth() );
 }
 
+// Does the separating axis stored in the cache still separate the hulls? This is the first thing
+// b3CollideHullsAtWidth checks and it uses exactly the same computations, so when this returns true
+// b3CollideHullsAtWidth would set the cache hit flag and return no points. The narrow phase calls this
+// directly for pairs that keep moving without touching, which is most pairs in a pile that is in motion.
+// Keep in sync with b3CollideHullsAtWidth.
+bool b3IsSeparatedByCachedAxis( const b3HullData* hullA, const b3HullData* hullB, b3Transform transformBtoA,
+								const b3SATCache* cache )
+{
+	float speculativeDistance = B3_SPECULATIVE_DISTANCE;
+
+	switch ( cache->type )
+	{
+		case b3_faceAxisA:
+		{
+			B3_ASSERT( cache->indexA < hullA->faceCount );
+
+			b3Plane plane = b3GetHullPlanes( hullA )[cache->indexA];
+			b3Vec3 searchDirectionInB = b3Neg( b3InvRotateVector( transformBtoA.q, plane.normal ) );
+
+			int vertexIndex = b3FindHullSupportVertex( hullB, searchDirectionInB );
+			b3Vec3 support = b3TransformPoint( transformBtoA, b3GetHullPoints( hullB )[vertexIndex] );
+			float separation = b3PlaneSeparation( plane, support );
+
+			return separation >= speculativeDistance;
+		}
+
+		case b3_faceAxisB:
+		{
+			B3_ASSERT( cache->indexB < hullB->faceCount );
+
+			b3Plane plane = b3GetHullPlanes( hullB )[cache->indexB];
+			b3Vec3 searchDirectionInA = b3Neg( b3RotateVector( transformBtoA.q, plane.normal ) );
+
+			int vertexIndex = b3FindHullSupportVertex( hullA, searchDirectionInA );
+			b3Vec3 support = b3InvTransformPoint( transformBtoA, b3GetHullPoints( hullA )[vertexIndex] );
+			float separation = b3PlaneSeparation( plane, support );
+
+			return separation >= speculativeDistance;
+		}
+
+		case b3_edgePairAxis:
+		{
+			const b3HullHalfEdge* edgesA = b3GetHullEdges( hullA );
+			const b3Plane* planesA = b3GetHullPlanes( hullA );
+			const b3Vec3* pointsA = b3GetHullPoints( hullA );
+			const b3HullHalfEdge* edgesB = b3GetHullEdges( hullB );
+			const b3Plane* planesB = b3GetHullPlanes( hullB );
+			const b3Vec3* pointsB = b3GetHullPoints( hullB );
+
+			int indexA = cache->indexA;
+			const b3HullHalfEdge* edge1 = edgesA + indexA;
+			const b3HullHalfEdge* twin1 = edgesA + indexA + 1;
+
+			b3Vec3 pA = pointsA[edge1->origin];
+			b3Vec3 qA = pointsA[twin1->origin];
+			b3Vec3 eA = b3Sub( qA, pA );
+
+			b3Vec3 uA = planesA[edge1->face].normal;
+			b3Vec3 vA = planesA[twin1->face].normal;
+
+			int indexB = cache->indexB;
+			const b3HullHalfEdge* edge2 = edgesB + indexB;
+			const b3HullHalfEdge* twin2 = edgesB + indexB + 1;
+
+			b3Vec3 pB = b3TransformPoint( transformBtoA, pointsB[edge2->origin] );
+			b3Vec3 qB = b3TransformPoint( transformBtoA, pointsB[twin2->origin] );
+			b3Vec3 eB = b3Sub( qB, pB );
+
+			b3Vec3 uB = b3RotateVector( transformBtoA.q, planesB[edge2->face].normal );
+			b3Vec3 vB = b3RotateVector( transformBtoA.q, planesB[twin2->face].normal );
+
+			float cba = b3Dot( uB, eA );
+			float dba = b3Dot( vB, eA );
+			float adc = -b3Dot( uA, eB );
+			float bdc = -b3Dot( vA, eB );
+
+			if ( cba * dba < 0.0f && adc * bdc < 0.0f && cba * bdc > 0.0f )
+			{
+				float squaredTolerance = B3_PARALLEL_EDGE_TOL * B3_PARALLEL_EDGE_TOL;
+				if ( b3MaxFloat( cba * cba, dba * dba ) >= squaredTolerance * b3LengthSquared( eA ) )
+				{
+					float t = cba / ( cba - dba );
+					b3Vec3 axis = b3Lerp( uB, vB, t );
+					axis = b3Normalize( axis );
+					float separation = b3Dot( axis, b3Sub( qA, qB ) );
+
+					return separation > speculativeDistance;
+				}
+			}
+
+			return false;
+		}
+
+		default:
+			return false;
+	}
+}
+
 void b3CollideHullsAtWidth( b3LocalManifold* manifold, int capacity, const b3HullData* hullA, const b3HullData* hullB,
 							b3Transform transformBtoA, b3SATCache* cache, int simdWidth )
 {

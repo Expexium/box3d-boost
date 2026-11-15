@@ -1765,6 +1765,110 @@ void b3SolveJoint( b3JointSim* joint, b3StepContext* context, bool useBias )
 	}
 }
 
+int b3GetWideSphericalJointByteCount( int simdWidth )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( simdWidth == 8 )
+	{
+		return b3GetWideSphericalJointByteCountW8();
+	}
+#endif
+
+	B3_UNUSED( simdWidth );
+	return b3GetWideSphericalJointByteCountW4();
+}
+
+int b3GetWideRevoluteJointByteCount( int simdWidth )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( simdWidth == 8 )
+	{
+		return b3GetWideRevoluteJointByteCountW8();
+	}
+#endif
+
+	B3_UNUSED( simdWidth );
+	return b3GetWideRevoluteJointByteCountW4();
+}
+
+void b3PrepareWideJoints( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3PrepareWideJointsW8( block, context );
+		return;
+	}
+#endif
+
+	b3PrepareWideJointsW4( block, context );
+}
+
+void b3StoreWideJoints( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3StoreWideJointsW8( block, context );
+		return;
+	}
+#endif
+
+	b3StoreWideJointsW4( block, context );
+}
+
+void b3WarmStartSphericalJoints( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3WarmStartSphericalJointsW8( block, context );
+		return;
+	}
+#endif
+
+	b3WarmStartSphericalJointsW4( block, context );
+}
+
+void b3SolveSphericalJoints( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3SolveSphericalJointsW8( block, context, useBias, workerIndex );
+		return;
+	}
+#endif
+
+	b3SolveSphericalJointsW4( block, context, useBias, workerIndex );
+}
+
+void b3WarmStartRevoluteJoints( b3SolverBlock block, b3StepContext* context )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3WarmStartRevoluteJointsW8( block, context );
+		return;
+	}
+#endif
+
+	b3WarmStartRevoluteJointsW4( block, context );
+}
+
+void b3SolveRevoluteJoints( b3SolverBlock block, b3StepContext* context, bool useBias, int workerIndex )
+{
+#if defined( B3_SIMD_HAS_WIDTH_8 )
+	if ( context->world->simdWidth == 8 )
+	{
+		b3SolveRevoluteJointsW8( block, context, useBias, workerIndex );
+		return;
+	}
+#endif
+
+	b3SolveRevoluteJointsW4( block, context, useBias, workerIndex );
+}
+
 void b3PrepareJoints_Overflow( b3StepContext* context )
 {
 	b3TracyCZoneNC( prepare_joints, "PrepJoints", b3_colorOldLace, true );
