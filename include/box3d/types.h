@@ -3257,6 +3257,13 @@ typedef struct b3DebugDraw
 	/// Option to draw islands as bounding boxes
 	bool drawIslands;
 
+	/// Option to draw the bonds of destructibles
+	bool drawBonds;
+
+	/// Option to color the bonds of destructibles by stress. Green to red up to the elastic limit,
+	/// then blue to magenta up to the fatal limit.
+	bool drawBondStress;
+
 	/// User context that is passed as an argument to drawing callback functions
 	void* context;
 } b3DebugDraw;

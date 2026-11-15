@@ -30,6 +30,11 @@ set(BOX3D_SOURCE_FILES
 	core.c
 	core.h
 	ctz.h
+	destruction_cook.c
+	destruction_step.c
+	destruction_stress.c
+	destruction.c
+	destruction.h
 	distance_joint.c
 	distance.c
 	dynamic_tree.c
@@ -111,6 +116,7 @@ set(BOX3D_INCLUDE_FILES
 	../include/box3d/collision.h
 	../include/box3d/config.h
 	../include/box3d/constants.h
+	../include/box3d/destruction.h
 	../include/box3d/id.h
 	../include/box3d/math_functions.h
 	../include/box3d/types.h

@@ -20,8 +20,11 @@ typedef enum b3ShapeFlags
 	b3_enableCustomFiltering = 0x04,
 	b3_enableHitEvents = 0x08,
 	b3_enablePreSolveEvents = 0x10,
-	// 0x20 is free, it was the enlarged AABB flag before the broad-phase marked the tree
+	// This shape is a fragment of a destructible. See destruction.h
+	b3_destructibleShape = 0x20,
 	b3_enableSpeculative = 0x40,
+	// Transient mark used while a batch of shapes moves to another body.
+	b3_shapeMoveMark = 0x80,
 } b3ShapeFlags;
 
 typedef struct b3Shape
@@ -78,6 +81,10 @@ void b3CreateShapeProxy( b3World* world, b3Shape* shape, b3BodyType type, b3Worl
 void b3DestroyShapeProxy( b3Shape* shape, b3BroadPhase* bp );
 
 void b3DestroyShapeAllocations( b3World* world, b3Shape* shape );
+
+// Move shapes that all live on the source body to the target body. This gives exactly the same result
+// as calling b3Shape_SetBody for each shape in order, but it walks the source contacts only once.
+void b3MoveShapes( b3World* world, const int* shapeIds, int count, int sourceBodyId, int targetBodyId );
 
 b3MassData b3ComputeShapeMass( const b3Shape* shape );
 b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter );

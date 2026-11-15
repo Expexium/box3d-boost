@@ -6,6 +6,7 @@
 #include "aabb.h"
 #include "contact.h"
 #include "core.h"
+#include "destruction.h"
 #include "id_pool.h"
 #include "island.h"
 #include "joint.h"
@@ -371,6 +372,12 @@ void b3DestroyBody( b3BodyId bodyId )
 	world->locked = true;
 
 	b3Body* body = b3GetBodyFullId( world, bodyId );
+
+	if ( world->destruction != NULL )
+	{
+		// Let the destruction solver forget the fragments on this body.
+		b3DestructionOnBodyDestroyed( world, body );
+	}
 
 	// Wake bodies attached to this body, even if this body is static.
 	bool wakeBodies = true;

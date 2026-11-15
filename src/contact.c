@@ -5,6 +5,7 @@
 
 #include "algorithm.h"
 #include "body.h"
+#include "destruction.h"
 #include "island.h"
 #include "manifold.h"
 #include "physics_world.h"
@@ -618,6 +619,30 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 	return true;
 }
 
+// The destruction solver reads the impulses of contacts that touch a fragment of a destructible.
+static inline void b3UpdateDestructionFlag( b3World* world, b3Contact* contact, const b3Shape* shapeA, const b3Shape* shapeB,
+											bool touching )
+{
+	bool isWanted = false;
+	if ( touching && world->destruction != NULL && ( ( shapeA->flags | shapeB->flags ) & b3_destructibleShape ) != 0 )
+	{
+		// Loose rubble that cannot break any further is inert. A contact matters if either side is not.
+		const b3ShapeFragment* shapeFragments = world->destruction->shapeFragments.data;
+		bool wantsA = ( shapeA->flags & b3_destructibleShape ) != 0 && shapeFragments[shapeA->id].isInert == false;
+		bool wantsB = ( shapeB->flags & b3_destructibleShape ) != 0 && shapeFragments[shapeB->id].isInert == false;
+		isWanted = wantsA || wantsB;
+	}
+
+	if ( isWanted )
+	{
+		contact->flags |= b3_simDestructionContact;
+	}
+	else
+	{
+		contact->flags &= ~b3_simDestructionContact;
+	}
+}
+
 static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* contact, b3Shape* shapeA, b3WorldTransform xfA,
 								   b3Shape* shapeB, b3WorldTransform xfB, bool flip, b3Arena arena )
 {
@@ -730,6 +755,8 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 		contact->flags &= ~b3_simEnableHitEvent;
 	}
 
+	b3UpdateDestructionFlag( world, contact, shapeA, shapeB, true );
+
 	return true;
 }
 
@@ -803,6 +830,8 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 				contact->flags &= ~b3_simEnableHitEvent;
 			}
 
+			b3UpdateDestructionFlag( world, contact, shapeA, shapeB, touching );
+
 			B3_ASSERT( ( touching == true && contact->manifoldCount > 0 ) ||
 					   ( touching == false && contact->manifoldCount == 0 ) );
 		}
@@ -854,6 +883,8 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 		{
 			contact->flags &= ~b3_simEnableHitEvent;
 		}
+
+		b3UpdateDestructionFlag( world, contact, shapeA, shapeB, touching );
 
 		B3_ASSERT( ( touching == true && contact->manifoldCount > 0 ) || ( touching == false && contact->manifoldCount == 0 ) );
 	}

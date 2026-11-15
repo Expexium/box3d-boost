@@ -606,7 +606,8 @@ B3_FORCE_INLINE bool b3PrepareConstraintW( b3ContactConstraintWide* c, b3Contact
 			contactLanes[lane] = contact;
 			simLanesA[lane] = indexA == B3_NULL_INDEX ? &b3_zeroBodySim : sims + indexA;
 			simLanesB[lane] = indexB == B3_NULL_INDEX ? &b3_zeroBodySim : sims + indexB;
-			hitEventLanes |= ( contact->flags & b3_simEnableHitEvent ) != 0 ? 1 << lane : 0;
+			// The destruction solver needs the approach velocity to measure impact energy.
+			hitEventLanes |= ( contact->flags & ( b3_simEnableHitEvent | b3_simDestructionContact ) ) != 0 ? 1 << lane : 0;
 			maxManifoldCount = b3MaxInt( maxManifoldCount, contact->manifoldCount );
 		}
 		else
@@ -1480,6 +1481,9 @@ B3_FORCE_INLINE void b3StoreImpulsesW( b3SolverBlock block, b3StepContext* conte
 	bool hasHitEvents = taskContext->hasHitEvents;
 	float negHitThreshold = -world->hitEventThreshold;
 
+	// NULL when the world has no destruction, which also covers a stale contact flag in a replay world.
+	b3BitSet* destructionBitSet = world->destruction != NULL ? &taskContext->destructionBitSet : NULL;
+
 	b3ContactConstraintWide* c = b3GetConstraintW( base, manifoldStarts, block.startIndex, fixedManifoldCount );
 	for ( int i = 0; i < block.count; ++i )
 	{
@@ -1549,6 +1553,11 @@ B3_FORCE_INLINE void b3StoreImpulsesW( b3SolverBlock block, b3StepContext* conte
 					mp->normalImpulse = normalImpulse[lane];
 					mp->totalNormalImpulse = totalNormalImpulse[lane];
 				}
+			}
+
+			if ( destructionBitSet != NULL && ( contact->flags & b3_simDestructionContact ) != 0 )
+			{
+				b3SetBit( destructionBitSet, contact->contactId );
 			}
 
 			if ( ( contact->flags & b3_simEnableHitEvent ) != 0 )

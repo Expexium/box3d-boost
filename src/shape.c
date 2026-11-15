@@ -6,6 +6,7 @@
 #include "body.h"
 #include "broad_phase.h"
 #include "contact.h"
+#include "destruction.h"
 #include "physics_world.h"
 #include "recording.h"
 #include "sensor.h"
@@ -590,6 +591,12 @@ void b3DestroyShape( b3ShapeId shapeId, bool updateBodyMass )
 	// need to wake bodies because this might be a static body
 	bool wakeBodies = true;
 
+	if ( shape->flags & b3_destructibleShape )
+	{
+		// Let the destruction solver forget this fragment shape.
+		b3DestructionOnShapeDestroyed( world, shape );
+	}
+
 	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
 	b3DestroyShapeInternal( world, shape, body, wakeBodies );
 
@@ -597,6 +604,213 @@ void b3DestroyShape( b3ShapeId shapeId, bool updateBodyMass )
 	{
 		b3UpdateBodyMassData( world, body );
 	}
+
+	world->locked = false;
+}
+
+void b3MoveShapes( b3World* world, const int* shapeIds, int count, int sourceBodyId, int targetBodyId )
+{
+	B3_ASSERT( world->locked );
+
+	if ( count == 0 || sourceBodyId == targetBodyId )
+	{
+		return;
+	}
+
+	b3Body* source = b3Array_Get( world->bodies, sourceBodyId );
+	b3Body* target = b3Array_Get( world->bodies, targetBodyId );
+
+	// Both bodies change, so neither may stay asleep. This only moves body sims between solver sets,
+	// the body pointers stay valid.
+	b3WakeBody( world, source );
+	b3WakeBody( world, target );
+
+	// Destroy the contacts of the moved shapes with a single walk of the source contacts. The order must
+	// match moving the shapes one at a time: shape by shape, and for each shape in contact list order.
+	// Otherwise a recording, which replays this as single moves, would diverge.
+	int shapeCapacity = world->shapes.count;
+	int contactCapacity = source->contactCount;
+
+	// Only the entries of marked shapes are written and read, so this needs no initialization.
+	int* shapeOrder = b3StackAlloc( &world->stack, shapeCapacity * sizeof( int ), "move order" );
+	int* hitContacts = b3StackAlloc( &world->stack, contactCapacity * sizeof( int ), "move contacts" );
+	int* hitOrders = b3StackAlloc( &world->stack, contactCapacity * sizeof( int ), "move contact order" );
+	int* bucketStarts = b3StackAlloc( &world->stack, ( count + 1 ) * sizeof( int ), "move buckets" );
+	int* sortedContacts = b3StackAlloc( &world->stack, contactCapacity * sizeof( int ), "move sorted" );
+
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Shape* shape = b3Array_Get( world->shapes, shapeIds[i] );
+		B3_ASSERT( shape->bodyId == sourceBodyId );
+		B3_ASSERT( ( shape->flags & b3_shapeMoveMark ) == 0 );
+		shape->flags |= b3_shapeMoveMark;
+		shapeOrder[shapeIds[i]] = i;
+		bucketStarts[i] = 0;
+	}
+	bucketStarts[count] = 0;
+
+	int hitCount = 0;
+	int contactKey = source->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		int contactId = contactKey >> 1;
+		int edgeIndex = contactKey & 1;
+
+		b3Contact* contact = b3Array_Get( world->contacts, contactId );
+		contactKey = contact->edges[edgeIndex].nextKey;
+
+		// Edge 0 belongs to the body of shape A.
+		int shapeId = edgeIndex == 0 ? contact->shapeIdA : contact->shapeIdB;
+		const b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+		if ( shape->flags & b3_shapeMoveMark )
+		{
+			int order = shapeOrder[shapeId];
+			hitContacts[hitCount] = contactId;
+			hitOrders[hitCount] = order;
+			bucketStarts[order + 1] += 1;
+			hitCount += 1;
+		}
+	}
+
+	// Stable counting sort by shape order.
+	for ( int i = 0; i < count; ++i )
+	{
+		bucketStarts[i + 1] += bucketStarts[i];
+	}
+
+	for ( int i = 0; i < hitCount; ++i )
+	{
+		int order = hitOrders[i];
+		sortedContacts[bucketStarts[order]] = hitContacts[i];
+		bucketStarts[order] += 1;
+	}
+
+	for ( int i = 0; i < hitCount; ++i )
+	{
+		b3Contact* contact = b3Array_Get( world->contacts, sortedContacts[i] );
+		b3DestroyContact( world, contact, true );
+	}
+
+	b3StackFree( &world->stack, sortedContacts );
+	b3StackFree( &world->stack, bucketStarts );
+	b3StackFree( &world->stack, hitOrders );
+	b3StackFree( &world->stack, hitContacts );
+	b3StackFree( &world->stack, shapeOrder );
+
+	bool sourceEnabled = source->setIndex != b3_disabledSet;
+	bool targetEnabled = target->setIndex != b3_disabledSet;
+	b3WorldTransform sourceTransform = b3GetBodyTransformQuick( world, source );
+	b3WorldTransform targetTransform = b3GetBodyTransformQuick( world, target );
+
+	// A proxy can stay in the tree when it already sits in the right tree at the right place.
+	bool sameFrame = sourceEnabled && targetEnabled && source->type == target->type &&
+					 memcmp( &sourceTransform, &targetTransform, sizeof( b3WorldTransform ) ) == 0;
+
+	for ( int i = 0; i < count; ++i )
+	{
+		int shapeId = shapeIds[i];
+		b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+		shape->flags &= ~b3_shapeMoveMark;
+
+		// Remove the shape from the source body's doubly linked list.
+		if ( shape->prevShapeId != B3_NULL_INDEX )
+		{
+			b3Shape* prevShape = b3Array_Get( world->shapes, shape->prevShapeId );
+			prevShape->nextShapeId = shape->nextShapeId;
+		}
+
+		if ( shape->nextShapeId != B3_NULL_INDEX )
+		{
+			b3Shape* nextShape = b3Array_Get( world->shapes, shape->nextShapeId );
+			nextShape->prevShapeId = shape->prevShapeId;
+		}
+
+		if ( shapeId == source->headShapeId )
+		{
+			source->headShapeId = shape->nextShapeId;
+		}
+
+		source->shapeCount -= 1;
+
+		// Add to the target body's doubly linked list.
+		if ( target->headShapeId != B3_NULL_INDEX )
+		{
+			b3Shape* headShape = b3Array_Get( world->shapes, target->headShapeId );
+			headShape->prevShapeId = shapeId;
+		}
+
+		shape->prevShapeId = B3_NULL_INDEX;
+		shape->nextShapeId = target->headShapeId;
+		target->headShapeId = shapeId;
+		target->shapeCount += 1;
+
+		shape->bodyId = targetBodyId;
+
+		if ( targetEnabled == false )
+		{
+			b3DestroyShapeProxy( shape, &world->broadPhase );
+		}
+		else if ( sameFrame && shape->proxyKey != B3_NULL_INDEX )
+		{
+			// The contacts were destroyed, so the broad-phase must look at this proxy again.
+			b3BroadPhase_MarkProxyMovedSerial( &world->broadPhase, shape->proxyKey );
+		}
+		else
+		{
+			b3DestroyShapeProxy( shape, &world->broadPhase );
+
+			bool forcePairCreation = true;
+			b3CreateShapeProxy( world, shape, target->type, targetTransform, forcePairCreation );
+		}
+	}
+
+	// The mass of both bodies is now stale. Static bodies have no mass.
+	if ( source->type != b3_staticBody && ( source->flags & b3_dirtyMass ) == 0 )
+	{
+		source->flags |= b3_dirtyMass;
+		b3SyncBodyFlags( world, source );
+	}
+
+	if ( target->type != b3_staticBody && ( target->flags & b3_dirtyMass ) == 0 )
+	{
+		target->flags |= b3_dirtyMass;
+		b3SyncBodyFlags( world, target );
+	}
+
+	b3ValidateSolverSets( world );
+}
+
+void b3Shape_SetBody( b3ShapeId shapeId, b3BodyId bodyId )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	B3_ASSERT( shapeId.world0 == bodyId.world0 );
+
+	b3Shape* shape = b3GetShape( world, shapeId );
+	b3Body* target = b3GetBodyFullId( world, bodyId );
+
+	if ( shape->bodyId == target->id )
+	{
+		return;
+	}
+
+	if ( target->type != b3_staticBody && b3IsConvex( shape->type ) == false )
+	{
+		// Meshes, height fields, and compounds only collide on static bodies.
+		B3_ASSERT( false );
+		return;
+	}
+
+	B3_REC( world, ShapeSetBody, shapeId, bodyId );
+
+	world->locked = true;
+
+	int id = shape->id;
+	b3MoveShapes( world, &id, 1, shape->bodyId, target->id );
 
 	world->locked = false;
 }

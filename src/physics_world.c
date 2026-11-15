@@ -11,6 +11,7 @@
 #include "contact.h"
 #include "core.h"
 #include "ctz.h"
+#include "destruction.h"
 #include "hull.h"
 #include "island.h"
 #include "joint.h"
@@ -180,6 +181,7 @@ static void b3CreateWorkerContexts( b3World* world )
 		world->taskContexts.data[i].contactStateBitSet = b3CreateBitSet( 1024 );
 		world->taskContexts.data[i].hitEventBitSet = b3CreateBitSet( 1024 );
 		world->taskContexts.data[i].hasHitEvents = false;
+		world->taskContexts.data[i].destructionBitSet = b3CreateBitSet( 1024 );
 		world->taskContexts.data[i].jointStateBitSet = b3CreateBitSet( 1024 );
 		world->taskContexts.data[i].awakeIslandBitSet = b3CreateBitSet( 256 );
 		world->taskContexts.data[i].splitIslandId = B3_NULL_INDEX;
@@ -197,6 +199,7 @@ static void b3DestroyWorkerContexts( b3World* world )
 		b3Array_Destroy( world->taskContexts.data[i].pairKeys );
 		b3DestroyBitSet( &world->taskContexts.data[i].contactStateBitSet );
 		b3DestroyBitSet( &world->taskContexts.data[i].hitEventBitSet );
+		b3DestroyBitSet( &world->taskContexts.data[i].destructionBitSet );
 		b3DestroyBitSet( &world->taskContexts.data[i].jointStateBitSet );
 		b3DestroyBitSet( &world->taskContexts.data[i].awakeIslandBitSet );
 
@@ -420,6 +423,9 @@ void b3DestroyWorld( b3WorldId worldId )
 
 	// Detach any recording before teardown. The user owns and frees the recording buffer.
 	b3StopRecordingInternal( world );
+
+	// The destruction solver only holds its own bookkeeping. The bodies and shapes go with the world.
+	b3DestroyDestruction( world );
 
 	if ( world->scheduler != NULL )
 	{
@@ -1045,6 +1051,12 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 		return;
 	}
 
+	if ( world->destruction != NULL )
+	{
+		// This may move bodies that follow a host, so it comes before the step is recorded.
+		b3DestructionPreStep( world, timeStep );
+	}
+
 	B3_REC( world, Step, worldId, timeStep, subStepCount );
 
 	world->locked = true;
@@ -1164,6 +1176,13 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 		world->profile.sensors = b3GetMilliseconds( sensorTicks );
 	}
 
+	// Destruction: turn the contact impulses of this step into stress and decide what breaks.
+	// This only reads the world. The changes are applied below, once the world is unlocked.
+	if ( world->destruction != NULL && timeStep > 0.0f )
+	{
+		b3DestructionAnalyze( world, &context );
+	}
+
 	world->profile.step = b3GetMilliseconds( stepTicks );
 
 	B3_ASSERT( world->stack.allocation == 0 );
@@ -1204,6 +1223,14 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 		{
 			b3RecAccumulateBounds( world->recording, worldBounds );
 		}
+	}
+
+	// Destruction: break bonds and split bodies. This comes after the state hash so that in a recording
+	// the changes read as ordinary operations ahead of the next step. A replay then needs no destruction
+	// solver to reproduce them.
+	if ( world->destruction != NULL )
+	{
+		b3DestructionCommit( world );
 	}
 
 	b3TracyCZoneEnd( world_step );
@@ -1712,6 +1739,8 @@ void b3World_Draw( b3WorldId worldId, b3DebugDraw* draw, uint64_t maskBits )
 			draw->DrawStringFcn( ps, buffer, line->color, draw->context );
 		}
 	}
+
+	b3DrawDestruction( world, draw );
 }
 
 b3AABB b3World_GetBounds( b3WorldId worldId )
@@ -1874,6 +1903,51 @@ bool b3Body_IsValid( b3BodyId id )
 	B3_ASSERT( body->localIndex != B3_NULL_INDEX );
 
 	if ( body->generation != id.generation )
+	{
+		// this id is orphaned
+		return false;
+	}
+
+	return true;
+}
+
+// This must stay safe for an id whose world was destroyed, so it does not go through b3GetWorld.
+bool b3Destructible_IsValid( b3DestructibleId id )
+{
+	if ( B3_MAX_WORLDS <= id.world0 )
+	{
+		// invalid world
+		return false;
+	}
+
+	b3World* world = b3_worlds + id.world0;
+	if ( world->worldId != id.world0 )
+	{
+		// world is free
+		return false;
+	}
+
+	b3Destruction* destruction = world->destruction;
+	if ( destruction == NULL )
+	{
+		// this world has no destructibles, or it is a free world in slot zero
+		return false;
+	}
+
+	if ( id.index1 < 1 || destruction->destructibles.count < id.index1 )
+	{
+		// invalid index
+		return false;
+	}
+
+	b3Destructible* destructible = destruction->destructibles.data + ( id.index1 - 1 );
+	if ( destructible->id == B3_NULL_INDEX )
+	{
+		// this was freed
+		return false;
+	}
+
+	if ( destructible->generation != id.generation )
 	{
 		// this id is orphaned
 		return false;
@@ -3607,6 +3681,78 @@ static bool ExplosionCallback( int proxyId, uint64_t userData, void* context )
 	b3Vec3 r = b3RotateVector( xf.q, b3Sub( closestPoint, bodySim->localCenter ) );
 	state->angularVelocity = b3Add( state->angularVelocity, b3MulMV( bodySim->invInertiaWorld, b3Cross( r, impulse ) ) );
 
+	if ( shape->flags & b3_destructibleShape )
+	{
+		// The blast also stresses the bonds around this fragment
+		b3DestructionOnExplosion( world, shape, impulse, b3TransformWorldPoint( xf, closestPoint ) );
+	}
+
+	return true;
+}
+
+// Fragments of a destructible on a static or kinematic body are not pushed by an explosion, but the
+// blast still loads the structure they belong to. Same impulse as for a dynamic shape.
+static bool ExplosionDestructionCallback( int proxyId, uint64_t userData, void* context )
+{
+	B3_UNUSED( proxyId );
+
+	int shapeId = (int)userData;
+	ExplosionContext* explosionContext = (ExplosionContext*)context;
+	b3World* world = explosionContext->world;
+
+	b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+	if ( ( shape->flags & b3_destructibleShape ) == 0 || shape->explosionScale == 0.0f || b3IsConvex( shape->type ) == false )
+	{
+		return true;
+	}
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3WorldTransform xf = b3GetBodyTransformQuick( world, body );
+	b3Vec3 localPosition = b3InvTransformWorldPoint( xf, explosionContext->position );
+
+	b3DistanceInput input;
+	input.proxyA = b3MakeShapeProxy( shape );
+	input.proxyB = (b3ShapeProxy){ &localPosition, 1, 0.0f };
+	input.transform = b3Transform_identity;
+	input.useRadii = true;
+
+	b3SimplexCache cache = { 0 };
+	b3DistanceOutput output = b3ShapeDistance( &input, &cache, NULL, 0 );
+
+	float radius = explosionContext->radius;
+	float falloff = explosionContext->falloff;
+	if ( output.distance > radius + falloff )
+	{
+		return true;
+	}
+
+	b3Vec3 closestPoint = output.pointA;
+	if ( output.distance == 0.0f )
+	{
+		closestPoint = b3GetShapeCentroid( shape );
+	}
+
+	b3Vec3 direction = b3Sub( closestPoint, localPosition );
+	if ( b3LengthSquared( direction ) > 100.0f * FLT_EPSILON * FLT_EPSILON )
+	{
+		direction = b3Normalize( direction );
+	}
+	else
+	{
+		direction = (b3Vec3){ 1.0f, 0.0f, 0.0f };
+	}
+
+	float area = b3GetShapeProjectedArea( shape, direction );
+	float scale = 1.0f;
+	if ( output.distance > radius && falloff > 0.0f )
+	{
+		scale = b3ClampFloat( ( radius + falloff - output.distance ) / falloff, 0.0f, 1.0f );
+	}
+
+	float magnitude = explosionContext->impulsePerArea * area * scale * shape->explosionScale;
+	b3Vec3 impulse = b3MulSV( magnitude, b3RotateVector( xf.q, direction ) );
+
+	b3DestructionOnExplosion( world, shape, impulse, b3TransformWorldPoint( xf, closestPoint ) );
 	return true;
 }
 
@@ -3642,6 +3788,14 @@ void b3World_Explode( b3WorldId worldId, const b3ExplosionDef* explosionDef )
 	b3AABB aabb = b3OffsetAABB( localBox, position );
 
 	b3DynamicTree_Query( world->broadPhase.trees + b3_dynamicBody, aabb, maskBits, false, ExplosionCallback, &explosionContext );
+
+	if ( world->destruction != NULL )
+	{
+		b3DynamicTree_Query( world->broadPhase.trees + b3_staticBody, aabb, maskBits, false, ExplosionDestructionCallback,
+							 &explosionContext );
+		b3DynamicTree_Query( world->broadPhase.trees + b3_kinematicBody, aabb, maskBits, false, ExplosionDestructionCallback,
+							 &explosionContext );
+	}
 
 	world->locked = false;
 }

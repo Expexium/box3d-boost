@@ -1902,6 +1902,11 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 			b3SetBitCountAndClear( &taskContext->hitEventBitSet, contactIdCapacity );
 			taskContext->hasHitEvents = false;
 
+			if ( world->destruction != NULL )
+			{
+				b3SetBitCountAndClear( &taskContext->destructionBitSet, contactIdCapacity );
+			}
+
 			workerContext[i].context = stepContext;
 			workerContext[i].workerIndex = i;
 

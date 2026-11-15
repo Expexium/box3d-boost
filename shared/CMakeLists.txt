@@ -3,6 +3,8 @@
 set(BOX3D_SHARED_FILES
 	benchmarks.c
 	benchmarks.h
+	destruction_scenes.c
+	destruction_scenes.h
 	determinism.c
 	determinism.h
 	ghost_collisions.c

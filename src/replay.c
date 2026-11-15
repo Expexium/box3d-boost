@@ -1159,6 +1159,11 @@ static void b3RecDispatch_ShapeEnableHitEvents( const b3RecArgs_ShapeEnableHitEv
 	b3Shape_EnableHitEvents( b3RecMakeShapeId( rdr, a->shape ), a->flag );
 }
 
+static void b3RecDispatch_ShapeSetBody( const b3RecArgs_ShapeSetBody* a, b3RecReader* rdr )
+{
+	b3Shape_SetBody( b3RecMakeShapeId( rdr, a->shape ), b3RecMakeBodyId( rdr, a->body ) );
+}
+
 static void b3RecDispatch_ShapeSetSphere( const b3RecArgs_ShapeSetSphere* a, b3RecReader* rdr )
 {
 	b3Shape_SetSphere( b3RecMakeShapeId( rdr, a->shape ), &a->sphere );

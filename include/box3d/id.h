@@ -73,6 +73,14 @@ typedef struct b3ContactId
 	uint32_t generation;
 } b3ContactId;
 
+/// Destructible id references a destructible instance. This should be treated as an opaque handle.
+typedef struct b3DestructibleId
+{
+	int32_t index1;
+	uint16_t world0;
+	uint16_t generation;
+} b3DestructibleId;
+
 // clang-format off
 #ifdef __cplusplus
 	/// A null id. Works for any id type.
@@ -94,6 +102,7 @@ static const b3BodyId b3_nullBodyId = B3_NULL_ID;
 static const b3ShapeId b3_nullShapeId = B3_NULL_ID;
 static const b3JointId b3_nullJointId = B3_NULL_ID;
 static const b3ContactId b3_nullContactId = B3_NULL_ID;
+static const b3DestructibleId b3_nullDestructibleId = B3_NULL_ID;
 
 /// Macro to determine if any id is null.
 #define B3_IS_NULL( id ) ( ( id ).index1 == 0 )
@@ -154,6 +163,19 @@ B3_ID_INLINE uint64_t b3StoreJointId( b3JointId id )
 B3_ID_INLINE b3JointId b3LoadJointId( uint64_t x )
 {
 	b3JointId id = { (int32_t)( x >> 32 ), (uint16_t)( x >> 16 ), (uint16_t)( x ) };
+	return id;
+}
+
+/// Store a destructible id into a uint64_t.
+B3_ID_INLINE uint64_t b3StoreDestructibleId( b3DestructibleId id )
+{
+	return ( (uint64_t)id.index1 << 32 ) | ( (uint64_t)id.world0 ) << 16 | (uint64_t)id.generation;
+}
+
+/// Load a uint64_t into a destructible id.
+B3_ID_INLINE b3DestructibleId b3LoadDestructibleId( uint64_t x )
+{
+	b3DestructibleId id = { (int32_t)( x >> 32 ), (uint16_t)( x >> 16 ), (uint16_t)( x ) };
 	return id;
 }
 
