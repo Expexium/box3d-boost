@@ -521,6 +521,10 @@ typedef struct b3ShapeFragment
 {
 	int destructibleId;
 	int fragmentIndex;
+
+	// The fragment is loose and has nothing to crumble into, so it can never carry a load or be
+	// crushed again. Contacts between inert shapes are of no interest to the solver.
+	bool isInert;
 } b3ShapeFragment;
 
 b3DeclareArray( b3ShapeFragment );
@@ -655,6 +659,7 @@ typedef struct b3Arena b3Arena;
 
 // Allocate the solver state for a piece with the given number of fragments and bonds.
 b3StressSystem* b3CreateStressSystem( int nodeCount, int bondCapacity );
+void b3UpdatePieceInert( b3World* world, b3Destructible* destructible, const b3DestructionPiece* piece );
 void b3DestroyStressSystem( b3StressSystem* system );
 int b3GetStressSystemByteCount( const b3StressSystem* system );
 

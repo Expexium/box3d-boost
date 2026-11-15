@@ -133,6 +133,27 @@ void b3DestructionPreStep( b3World* world, float timeStep )
 }
 
 // Turn one solved contact into the load on the fragment at either end.
+// Does the fragment of a shape have any use for the load of a contact?
+static inline bool b3WantsContactLoad( const b3Destruction* destruction, b3ShapeFragment link, float approachSpeed )
+{
+	const b3Destructible* destructible = destruction->destructibles.data + link.destructibleId;
+	int pieceIndex = destructible->fragmentPiece[link.fragmentIndex];
+	if ( pieceIndex < 0 )
+	{
+		return false;
+	}
+
+	const b3DestructionPiece* piece = destructible->pieces.data + pieceIndex;
+	if ( piece->flags & b3_pieceFrozen )
+	{
+		return false;
+	}
+
+	// A loose fragment has no bonds to load. Only a blow matters to it, for the energy that can
+	// crush it. Most contacts in a pile of rubble end here.
+	return piece->bondCount > 0 || approachSpeed > destruction->settings.impactVelocityThreshold;
+}
+
 static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3ContactLoad* loads )
 {
 	const b3Destruction* destruction = world->destruction;
@@ -143,7 +164,7 @@ static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3
 	const b3Shape* shapeA = world->shapes.data + contact->shapeIdA;
 	const b3Shape* shapeB = world->shapes.data + contact->shapeIdB;
 
-	b3ShapeFragment none = { B3_NULL_INDEX, B3_NULL_INDEX };
+	b3ShapeFragment none = { B3_NULL_INDEX, B3_NULL_INDEX, false };
 	b3ShapeFragment linkA = ( shapeA->flags & b3_destructibleShape ) != 0 ? destruction->shapeFragments.data[contact->shapeIdA] : none;
 	b3ShapeFragment linkB = ( shapeB->flags & b3_destructibleShape ) != 0 ? destruction->shapeFragments.data[contact->shapeIdB] : none;
 	if ( linkA.destructibleId == B3_NULL_INDEX && linkB.destructibleId == B3_NULL_INDEX )
@@ -197,7 +218,7 @@ static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3
 	const b3Body* bodyA = world->bodies.data + shapeA->bodyId;
 	const b3Body* bodyB = world->bodies.data + shapeB->bodyId;
 
-	if ( linkA.destructibleId != B3_NULL_INDEX )
+	if ( linkA.destructibleId != B3_NULL_INDEX && b3WantsContactLoad( destruction, linkA, approachSpeed ) )
 	{
 		b3ContactLoad* load = loads + 0;
 		load->destructibleId = linkA.destructibleId;
@@ -209,7 +230,7 @@ static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3
 		load->approachSpeed = approachSpeed;
 	}
 
-	if ( linkB.destructibleId != B3_NULL_INDEX )
+	if ( linkB.destructibleId != B3_NULL_INDEX && b3WantsContactLoad( destruction, linkB, approachSpeed ) )
 	{
 		b3ContactLoad* load = loads + 1;
 		load->destructibleId = linkB.destructibleId;
@@ -472,14 +493,6 @@ static void b3DistributeContactLoads( b3World* world )
 			continue;
 		}
 
-		// A loose fragment has no bonds to load. Only a blow matters to it, for the energy that can
-		// crush it. Most contacts in a pile of rubble end here.
-		if ( piece->bondCount == 0 && contactLoad->approachSpeed <= impactSpeed )
-		{
-			contactLoad->destructibleId = B3_NULL_INDEX;
-			continue;
-		}
-
 		b3Body* body = world->bodies.data + piece->bodyId;
 		const b3BodySim* bodySim = b3GetBodySim( world, body );
 		b3Quat rotation = bodySim->transform.q;
@@ -600,6 +613,13 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 		// still waiting for a deferred crush or split keeps the load alive.
 		bool hasPush = b3LengthSquared( load->externalImpulse ) + b3LengthSquared( load->externalAngularImpulse ) > 0.0f;
 		bool isSpent = hadImpulse == false && hasPush == false && b3LengthSquared( load->force ) < 1.0e-6f * weight * weight;
+
+		// A loose fragment has no bonds for a force to load. The blow was all that mattered to it.
+		if ( piece->bondCount == 0 && hasPush == false )
+		{
+			isSpent = true;
+		}
+
 		if ( isSpent )
 		{
 			if ( b3LengthSquared( load->solvedForce ) > 0.0f )
@@ -930,7 +950,7 @@ static void b3RemovePiece( b3World* world, b3Destructible* destructible, int pie
 			if ( rawId != B3_NULL_INDEX )
 			{
 				// The shape goes with the body
-				destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX };
+				destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false };
 				destructible->hullShapes[hullIndex] = B3_NULL_INDEX;
 			}
 		}
@@ -981,6 +1001,7 @@ static void b3ReleaseFragment( b3World* world, b3Destructible* destructible, int
 	destructible->fragmentLocal[node] = 0;
 
 	b3CreateFragmentShapes( world, destructible, node, bodyId, isDebris );
+	b3UpdatePieceInert( world, destructible, piece );
 
 	b3MassData massData = { piece->mass, piece->center, piece->inertia };
 	b3Body_SetMassData( bodyId, massData );
@@ -1261,6 +1282,11 @@ static void b3SplitPiece( b3World* world, b3Destructible* destructible, int piec
 		piece->flags &= ~b3_pieceTopologyDirty;
 		piece->bondCount = parts[0].bondCount;
 
+		if ( pieceAnchored == false )
+		{
+			b3UpdatePieceInert( world, destructible, piece );
+		}
+
 		if ( pieceAnchored == false && ( piece->flags & b3_pieceFrozen ) == 0 )
 		{
 			b3ComputePieceMass( destructible, piece );
@@ -1417,6 +1443,8 @@ static void b3SplitPiece( b3World* world, b3Destructible* destructible, int piec
 			}
 		}
 
+		b3UpdatePieceInert( world, destructible, newPiece );
+
 		bool isDebris = newPiece->radius < destructible->debrisRadius;
 		if ( isDebris )
 		{
@@ -1457,6 +1485,11 @@ static void b3SplitPiece( b3World* world, b3Destructible* destructible, int piec
 
 		piece->nodeCount = remaining;
 		piece->bondCount = remainingBonds;
+
+		if ( pieceAnchored == false )
+		{
+			b3UpdatePieceInert( world, destructible, piece );
+		}
 	}
 
 	// Measure how overloaded the bonds were that broke between the parts. A bond that broke in an
@@ -1727,17 +1760,54 @@ static void b3TransferMomentum( b3World* world )
 
 		// The load holds the impulse on the fragment. The impactor received the opposite, so this
 		// pushes it back along its way.
-		b3Vec3 impulse = b3MulSV( scale * b3MinFloat( piece->impactExcess, 1.0f ), contactLoad->impulse );
-		b3Body_ApplyLinearImpulse( b3MakeBodyId( world, contactLoad->otherBodyId ), impulse, contactLoad->point, true );
+		float length = b3Length( contactLoad->impulse );
+		if ( length <= 0.0f )
+		{
+			continue;
+		}
 
-		// A dynamic parent received that impulse as well. Take it out of the part that kept the body.
+		b3Vec3 direction = b3MulSV( 1.0f / length, contactLoad->impulse );
+
+		// A dynamic parent received the impulse of the hit as well. What the impactor gets back comes
+		// out of the part that kept the body.
+		const b3Body* parentBody = NULL;
 		if ( piece->parentPiece != B3_NULL_INDEX )
 		{
 			const b3DestructionPiece* parent = destructible->pieces.data + piece->parentPiece;
 			if ( parent->bodyId != B3_NULL_INDEX && ( parent->flags & ( b3_pieceAnchored | b3_pieceFrozen ) ) == 0 )
 			{
-				b3Body_ApplyLinearImpulseToCenter( b3MakeBodyId( world, parent->bodyId ), b3Neg( impulse ), true );
+				parentBody = world->bodies.data + parent->bodyId;
 			}
+		}
+
+		// The exchange only undoes part of the hit. Before the hit the impactor closed in on the
+		// fragment at the approach speed, and afterwards the two must not close in faster than that.
+		// The mass that limits this is the smaller of the two sides. Without the limit a small body
+		// caught between a heavy falling piece and the ground would be shot away with the momentum
+		// of the heavy piece, and so would a small parent.
+		const b3BodyState* otherState = b3GetBodyState( world, (b3Body*)other );
+		const b3BodyState* pieceState = b3GetBodyState( world, world->bodies.data + piece->bodyId );
+		float otherSpeed = otherState != NULL ? b3Dot( otherState->linearVelocity, direction ) : 0.0f;
+		float pieceSpeed = pieceState != NULL ? b3Dot( pieceState->linearVelocity, direction ) : 0.0f;
+		float closingSpeed = contactLoad->approachSpeed + pieceSpeed - otherSpeed;
+		if ( closingSpeed <= 0.0f || other->mass <= 0.0f )
+		{
+			continue;
+		}
+
+		float reducedMass = other->mass;
+		if ( parentBody != NULL && parentBody->mass > 0.0f )
+		{
+			reducedMass = other->mass * parentBody->mass / ( other->mass + parentBody->mass );
+		}
+
+		float wanted = scale * b3MinFloat( piece->impactExcess, 1.0f ) * length;
+		b3Vec3 impulse = b3MulSV( b3MinFloat( wanted, reducedMass * closingSpeed ), direction );
+		b3Body_ApplyLinearImpulse( b3MakeBodyId( world, contactLoad->otherBodyId ), impulse, contactLoad->point, true );
+
+		if ( parentBody != NULL )
+		{
+			b3Body_ApplyLinearImpulseToCenter( b3MakeBodyId( world, parentBody->id ), b3Neg( impulse ), true );
 		}
 	}
 }

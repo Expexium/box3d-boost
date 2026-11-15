@@ -172,6 +172,33 @@ b3BodyId b3CreateDestructionBody( b3World* world, b3Destructible* destructible, 
 	return bodyId;
 }
 
+// Mark the shapes of a piece as inert if it is a single loose fragment without children. Bonds never
+// form again, so this is for good. Most bodies in a pile of rubble end up like this, and so do most
+// contacts.
+void b3UpdatePieceInert( b3World* world, b3Destructible* destructible, const b3DestructionPiece* piece )
+{
+	if ( piece->nodeCount != 1 || piece->bondCount != 0 )
+	{
+		return;
+	}
+
+	const b3StructureFragment* fragment = b3GetStructureFragments( destructible->structure ) + piece->nodes[0];
+	if ( fragment->childCount != 0 )
+	{
+		return;
+	}
+
+	b3Destruction* destruction = world->destruction;
+	for ( int i = 0; i < fragment->hullCount; ++i )
+	{
+		int shapeId = destructible->hullShapes[fragment->firstHull + i];
+		if ( shapeId != B3_NULL_INDEX )
+		{
+			destruction->shapeFragments.data[shapeId].isInert = true;
+		}
+	}
+}
+
 void b3DestroyDestructionBody( b3World* world, b3Destructible* destructible, int bodyId )
 {
 	b3Destruction* destruction = world->destruction;
@@ -225,10 +252,10 @@ void b3CreateFragmentShapes( b3World* world, b3Destructible* destructible, int f
 		// The shape map follows the world shape array
 		while ( destruction->shapeFragments.count < world->shapes.count )
 		{
-			b3Array_Push( destruction->shapeFragments, ( (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX } ) );
+			b3Array_Push( destruction->shapeFragments, ( (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false } ) );
 		}
 
-		destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ destructible->id, fragmentIndex };
+		destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ destructible->id, fragmentIndex, false };
 		destructible->hullShapes[hullIndex] = rawId;
 	}
 }
@@ -253,7 +280,7 @@ void b3DestroyFragmentShapes( b3World* world, b3Destructible* destructible, int 
 		const b3Shape* shape = b3Array_Get( world->shapes, rawId );
 		b3ShapeId shapeId = { rawId + 1, world->worldId, shape->generation };
 
-		destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX };
+		destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false };
 		destructible->hullShapes[hullIndex] = B3_NULL_INDEX;
 
 		// The caller updates the body mass once all its fragments have changed
@@ -847,7 +874,7 @@ void b3DestroyDestructible( b3DestructibleId destructibleId )
 		int rawId = destructible->hullShapes[i];
 		if ( rawId != B3_NULL_INDEX )
 		{
-			destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX };
+			destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false };
 		}
 	}
 
@@ -936,7 +963,7 @@ void b3DestructionOnBodyDestroyed( b3World* world, b3Body* body )
 				int rawId = destructible->hullShapes[hullIndex];
 				if ( rawId != B3_NULL_INDEX )
 				{
-					destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX };
+					destruction->shapeFragments.data[rawId] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false };
 					destructible->hullShapes[hullIndex] = B3_NULL_INDEX;
 				}
 			}
@@ -996,7 +1023,7 @@ void b3DestructionOnShapeDestroyed( b3World* world, b3Shape* shape )
 		}
 	}
 
-	destruction->shapeFragments.data[shape->id] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX };
+	destruction->shapeFragments.data[shape->id] = (b3ShapeFragment){ B3_NULL_INDEX, B3_NULL_INDEX, false };
 }
 
 // Convert a world impulse at a world point into an impulse and angular impulse on a fragment in
@@ -1260,7 +1287,7 @@ float b3Destructible_GetStrengthScale( b3DestructibleId destructibleId )
 
 static b3ShapeFragment b3GetShapeFragment( b3World* world, b3ShapeId shapeId )
 {
-	b3ShapeFragment none = { B3_NULL_INDEX, B3_NULL_INDEX };
+	b3ShapeFragment none = { B3_NULL_INDEX, B3_NULL_INDEX, false };
 	b3Destruction* destruction = world->destruction;
 	int rawId = shapeId.index1 - 1;
 	if ( destruction == NULL || rawId < 0 || rawId >= destruction->shapeFragments.count )

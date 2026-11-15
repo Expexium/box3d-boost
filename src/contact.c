@@ -5,6 +5,7 @@
 
 #include "algorithm.h"
 #include "body.h"
+#include "destruction.h"
 #include "island.h"
 #include "manifold.h"
 #include "physics_world.h"
@@ -622,7 +623,17 @@ static bool b3ComputeConvexManifold( b3World* world, int workerIndex, b3Contact*
 static inline void b3UpdateDestructionFlag( b3World* world, b3Contact* contact, const b3Shape* shapeA, const b3Shape* shapeB,
 											bool touching )
 {
+	bool isWanted = false;
 	if ( touching && world->destruction != NULL && ( ( shapeA->flags | shapeB->flags ) & b3_destructibleShape ) != 0 )
+	{
+		// Loose rubble that cannot break any further is inert. A contact matters if either side is not.
+		const b3ShapeFragment* shapeFragments = world->destruction->shapeFragments.data;
+		bool wantsA = ( shapeA->flags & b3_destructibleShape ) != 0 && shapeFragments[shapeA->id].isInert == false;
+		bool wantsB = ( shapeB->flags & b3_destructibleShape ) != 0 && shapeFragments[shapeB->id].isInert == false;
+		isWanted = wantsA || wantsB;
+	}
+
+	if ( isWanted )
 	{
 		contact->flags |= b3_simDestructionContact;
 	}

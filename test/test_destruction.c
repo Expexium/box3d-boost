@@ -7,6 +7,7 @@
 #include "box3d/box3d.h"
 #include "box3d/destruction.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -734,9 +735,11 @@ static int BuildingDemolitionTest( void )
 	ENSURE( intactCount < bondCount / 2 );
 	ENSURE( b3World_GetDestructionCounters( worldId ).pendingSplitCount == 0 );
 
-	// Every fragment that is still simulated ended up low, on the ground or on the pile, and none of
-	// them left the scene or fell through the ground
-	float top = 0.0f;
+	// The building is down: nearly all of its mass lies low, on the ground or on the pile. A strip of
+	// wall may still stand and a fragment may still be in the air, so this looks at the mass and not
+	// at the highest point. No fragment left the scene or fell through the ground.
+	float totalMass = 0.0f;
+	float highMass = 0.0f;
 	for ( int i = 0; i < structure->fragmentCount; ++i )
 	{
 		b3BodyId bodyId = b3Destructible_GetFragmentBody( buildingId, i );
@@ -749,10 +752,16 @@ static int BuildingDemolitionTest( void )
 		ENSURE( b3IsValidFloat( (float)center.x ) && b3IsValidFloat( (float)center.y ) && b3IsValidFloat( (float)center.z ) );
 		ENSURE( (float)center.y > -0.5f );
 		ENSURE( b3AbsFloat( (float)center.x ) < 60.0f && b3AbsFloat( (float)center.z ) < 60.0f );
-		top = b3MaxFloat( top, (float)center.y );
+
+		totalMass += fragments[i].mass;
+		if ( (float)center.y > 0.5f * height )
+		{
+			highMass += fragments[i].mass;
+		}
 	}
 
-	ENSURE( top < 0.6f * height );
+	ENSURE( totalMass > 0.0f );
+	ENSURE( highMass < 0.1f * totalMass );
 	MAYBE_UNUSED( maxStepTime );
 
 	DestroyBuildingCollapse();
@@ -989,6 +998,354 @@ static int HostMotionTest( void )
 		b3World_Step( worldId, s_timeStep, s_subStepCount );
 	}
 
+	ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) < bondCount );
+	ENSURE( b3Destructible_GetBodyCount( destructibleId ) > 1 );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// Find the support fragment closest to a point in structure space
+static int FindFragment( const b3StructureData* structure, b3Vec3 point )
+{
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+	int best = B3_NULL_INDEX;
+	float bestDistance = FLT_MAX;
+	for ( int i = 0; i < structure->fragmentCount; ++i )
+	{
+		if ( fragments[i].parent != B3_NULL_INDEX )
+		{
+			continue;
+		}
+
+		float distance = b3DistanceSquared( fragments[i].center, point );
+		if ( distance < bestDistance )
+		{
+			bestDistance = distance;
+			best = i;
+		}
+	}
+
+	return best;
+}
+
+// Shoot a heavy ball at a wall and return the speed it has left along its path
+static float RunPunch( float momentumTransferScale, int* brokenCount )
+{
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	b3DestructionSettings settings = b3World_GetDestructionSettings( worldId );
+	settings.momentumTransferScale = momentumTransferScale;
+	b3World_SetDestructionSettings( worldId, &settings );
+
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.0f;
+	b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 11 );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+	int bondCount = b3Destructible_GetBondCount( destructibleId );
+
+	StepWorld( worldId, 5 );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 1.5f, 4.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, 0.0f, -40.0f };
+	bodyDef.isBullet = true;
+	b3BodyId ballId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 7800.0f;
+	b3Sphere sphere = { b3Vec3_zero, 0.4f };
+	b3CreateSphereShape( ballId, &shapeDef, &sphere );
+
+	StepWorld( worldId, 20 );
+
+	float speed = -b3Body_GetLinearVelocity( ballId ).z;
+	*brokenCount = bondCount - b3Destructible_GetIntactBondCount( destructibleId );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return speed;
+}
+
+// The rigid body solver stops a ball against a wall as if the wall were whole. The bonds that
+// broke under the blow could not have resisted that much, so the solver hands the surplus back
+// and the ball punches through instead of stopping dead.
+static int MomentumTransferTest( void )
+{
+	int brokenWith = 0, brokenWithout = 0;
+	float speedWith = RunPunch( 1.0f, &brokenWith );
+	float speedWithout = RunPunch( 0.0f, &brokenWithout );
+
+	ENSURE( brokenWith > 0 );
+	ENSURE( brokenWithout > 0 );
+	ENSURE( speedWith > speedWithout + 1.0f );
+	return 0;
+}
+
+// Debris that falls asleep can turn into static rubble, which costs nothing from then on.
+static int FreezeDebrisTest( void )
+{
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+	b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 3 );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	def.freezeSleepingDebris = true;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+	b3BodyId anchorBodyId = b3Destructible_GetFragmentBody( destructibleId, 0 );
+
+	StepWorld( worldId, 10 );
+	ApplyBlast( worldId, (b3Pos){ 0.0f, 1.5f, 0.4f }, 1.2f, 2.0e5f, 4000.0f );
+	StepWorld( worldId, 900 );
+
+	b3BodyId bodies[2048];
+	int bodyCount = b3Destructible_GetBodies( destructibleId, bodies, 2048 );
+	int frozenCount = 0;
+	for ( int i = 0; i < bodyCount; ++i )
+	{
+		if ( B3_ID_EQUALS( bodies[i], anchorBodyId ) == false && b3Body_GetType( bodies[i] ) == b3_staticBody )
+		{
+			frozenCount += 1;
+		}
+	}
+
+	ENSURE( frozenCount > 10 );
+
+	// Frozen rubble is still the fragment's body
+	ENSURE( b3World_GetDestructionCounters( worldId ).bodyCount == bodyCount );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// The solver never creates more bodies in a step than it is allowed. A large break is finished over
+// the following steps.
+static int BodyBudgetTest( void )
+{
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	b3DestructionSettings settings = b3World_GetDestructionSettings( worldId );
+	settings.maxNewBodiesPerStep = 8;
+	b3World_SetDestructionSettings( worldId, &settings );
+
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+	b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 3 );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+
+	StepWorld( worldId, 10 );
+	ApplyBlast( worldId, (b3Pos){ 0.0f, 1.5f, 0.4f }, 1.5f, 2.0e5f, 8000.0f );
+
+	int waitingSteps = 0;
+	int createdCount = 0;
+	for ( int i = 0; i < 240; ++i )
+	{
+		b3World_Step( worldId, s_timeStep, s_subStepCount );
+
+		b3DestructionCounters counters = b3World_GetDestructionCounters( worldId );
+		ENSURE( counters.newBodyCount <= settings.maxNewBodiesPerStep );
+		createdCount += counters.newBodyCount;
+
+		// Something is waiting: a piece that could not be split yet or a fragment that could not
+		// crumble yet. Either way the step used its whole allowance.
+		if ( counters.newBodyCount == settings.maxNewBodiesPerStep )
+		{
+			waitingSteps += 1;
+		}
+	}
+
+
+	// The break needed far more bodies than one step allows, and it got them in the end
+	ENSURE( createdCount > 4 * settings.maxNewBodiesPerStep );
+	ENSURE( b3Destructible_GetBodyCount( destructibleId ) > 4 * settings.maxNewBodiesPerStep );
+	ENSURE( waitingSteps > 3 );
+	ENSURE( b3World_GetDestructionCounters( worldId ).pendingSplitCount == 0 );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// An impulse on one fragment. A nudge does nothing, a hard knock tears the fragment out of the wall
+// and sends it off in the direction of the push.
+static int ApplyImpulseTest( void )
+{
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.0f;
+	b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 11 );
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+	int bondCount = b3Destructible_GetBondCount( destructibleId );
+
+	int target = FindFragment( structure, (b3Vec3){ 0.0f, 1.5f, 0.0f } );
+	ENSURE( target != B3_NULL_INDEX );
+	b3BodyId anchorBodyId = b3Destructible_GetFragmentBody( destructibleId, target );
+	b3Pos point = b3ToPos( fragments[target].center );
+	float mass = fragments[target].mass;
+
+	StepWorld( worldId, 10 );
+
+	// Enough to move the fragment alone at a few centimeters per second
+	b3Destructible_ApplyImpulse( destructibleId, target, (b3Vec3){ 0.0f, 0.0f, -0.05f * mass }, point );
+	StepWorld( worldId, 30 );
+	ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == bondCount );
+	ENSURE( B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, target ), anchorBodyId ) );
+
+	// Enough to move it alone at 40 meters per second
+	b3Destructible_ApplyImpulse( destructibleId, target, (b3Vec3){ 0.0f, 0.0f, -40.0f * mass }, point );
+	StepWorld( worldId, 5 );
+
+	b3BodyId bodyId = b3Destructible_GetFragmentBody( destructibleId, target );
+	ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) < bondCount );
+	ENSURE( B3_IS_NON_NULL( bodyId ) );
+	ENSURE( B3_ID_EQUALS( bodyId, anchorBodyId ) == false );
+	ENSURE( b3Body_GetLinearVelocity( bodyId ).z < -5.0f );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// Radial damage can spread along the bonds or straight through space. Two walls stand close
+// together without touching. Damage that follows the bonds stays in the wall it hit. Damage that
+// goes through space reaches the other wall too.
+static int RadialDamageTest( void )
+{
+	DestructionBuilder* builder = CreateDestructionBuilder( 13 );
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+	b3Vec3 halfExtents = { 2.0f, 1.5f, 0.15f };
+	b3Transform nearWall = { { 0.0f, 1.5f, 0.0f }, b3Quat_identity };
+	b3Transform farWall = { { 0.0f, 1.5f, 1.0f }, b3Quat_identity };
+	AddFracturedBox( builder, nearWall, halfExtents, &fracture );
+	AddFracturedBox( builder, farWall, halfExtents, &fracture );
+	b3StructureData* structure = BuildStructure( builder );
+	DestroyDestructionBuilder( builder );
+	ENSURE( structure != NULL );
+
+	int nearFragment = FindFragment( structure, (b3Vec3){ 0.0f, 1.5f, 0.0f } );
+	int farFragment = FindFragment( structure, (b3Vec3){ 0.0f, 1.5f, 1.0f } );
+	ENSURE( nearFragment != farFragment );
+
+	for ( int pass = 0; pass < 2; ++pass )
+	{
+		b3WorldId worldId = CreateTestWorld( 1 );
+		CreateGround( worldId );
+
+		b3DestructibleDef def = b3DefaultDestructibleDef();
+		def.structure = structure;
+		b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+		StepWorld( worldId, 5 );
+
+		float nearHealth = b3Destructible_GetFragmentHealth( destructibleId, nearFragment );
+		float farHealth = b3Destructible_GetFragmentHealth( destructibleId, farFragment );
+		ENSURE( nearHealth > 0.0f && farHealth > 0.0f );
+
+		// Half of what it takes to crush a fragment, so nothing breaks and the health tells the story
+		b3RadialDamageDef damageDef = b3DefaultRadialDamageDef();
+		damageDef.position = (b3Pos){ 0.0f, 1.5f, 0.0f };
+		damageDef.innerRadius = 0.5f;
+		damageDef.outerRadius = 2.5f;
+		damageDef.damage = 0.5f * nearHealth;
+		damageDef.spreadAlongBonds = pass == 0;
+		b3World_ApplyRadialDamage( worldId, &damageDef );
+		StepWorld( worldId, 2 );
+
+		float nearAfter = b3Destructible_GetFragmentHealth( destructibleId, nearFragment );
+		float farAfter = b3Destructible_GetFragmentHealth( destructibleId, farFragment );
+
+		// The wall that was hit takes damage either way
+		ENSURE( nearAfter < nearHealth );
+
+		if ( pass == 0 )
+		{
+			ENSURE( farAfter == farHealth );
+		}
+		else
+		{
+			ENSURE( farAfter < farHealth );
+		}
+
+		b3DestroyWorld( worldId );
+	}
+
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// The application may destroy a fragment shape itself, for example to carve a hole. The fragment
+// stays in the structure without its shape and the solver carries on.
+static int DestroyFragmentShapeTest( void )
+{
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+	b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 3 );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+	int bondCount = b3Destructible_GetBondCount( destructibleId );
+	b3BodyId anchorBodyId = b3Destructible_GetFragmentBody( destructibleId, 0 );
+
+	// Find the shape of a fragment in the middle of the wall
+	int target = FindFragment( structure, (b3Vec3){ 0.0f, 1.5f, 0.0f } );
+	b3ShapeId shapes[1024];
+	int shapeCount = b3Body_GetShapes( anchorBodyId, shapes, 1024 );
+	b3ShapeId targetShapeId = b3_nullShapeId;
+	for ( int i = 0; i < shapeCount; ++i )
+	{
+		ENSURE( B3_ID_EQUALS( b3Shape_GetDestructible( shapes[i] ), destructibleId ) );
+		if ( b3Shape_GetFragmentIndex( shapes[i] ) == target )
+		{
+			targetShapeId = shapes[i];
+		}
+	}
+
+	ENSURE( B3_IS_NON_NULL( targetShapeId ) );
+
+	b3DestroyShape( targetShapeId, false );
+	ENSURE( b3Shape_IsValid( targetShapeId ) == false );
+	ENSURE( b3Body_GetShapeCount( anchorBodyId ) == shapeCount - 1 );
+
+	// Nothing else changed
+	StepWorld( worldId, 30 );
+	ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == bondCount );
+	ENSURE( b3Destructible_GetBodyCount( destructibleId ) == 1 );
+
+	// The wall still breaks like any other, including the fragment that lost its shape
+	ApplyBlast( worldId, (b3Pos){ 0.0f, 1.5f, 0.4f }, 1.2f, 2.0e5f, 8000.0f );
+	StepWorld( worldId, 120 );
+	ENSURE( b3Destructible_IsValid( destructibleId ) );
 	ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) < bondCount );
 	ENSURE( b3Destructible_GetBodyCount( destructibleId ) > 1 );
 
@@ -1413,6 +1770,12 @@ int DestructionTest( void )
 	RUN_SUBTEST( DebrisLifetimeTest );
 	RUN_SUBTEST( StrengthScaleTest );
 	RUN_SUBTEST( HostMotionTest );
+	RUN_SUBTEST( MomentumTransferTest );
+	RUN_SUBTEST( FreezeDebrisTest );
+	RUN_SUBTEST( BodyBudgetTest );
+	RUN_SUBTEST( ApplyImpulseTest );
+	RUN_SUBTEST( RadialDamageTest );
+	RUN_SUBTEST( DestroyFragmentShapeTest );
 	RUN_SUBTEST( CollapseDeterminismTest );
 	RUN_SUBTEST( CollapseRecordingTest );
 	RUN_SUBTEST( BlastedWallTest );

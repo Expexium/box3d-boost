@@ -693,9 +693,13 @@ enum
 	e_maxBuildings = 16,
 	e_blastStep = 30,
 
-	// Steps between the column lines of one building, and between two buildings
+	// Steps between the column lines of one floor, between two charged floors, and between two buildings
 	e_lineDelay = 8,
+	e_floorDelay = 12,
 	e_buildingDelay = 45,
+
+	// Every this many floors has charges, starting with the ground floor
+	e_chargeFloorSpacing = 3,
 };
 
 static b3StructureData* s_buildingStructure;
@@ -761,8 +765,11 @@ void CreateBuildingCollapse( b3WorldId worldId )
 
 void StepBuildingCollapse( b3WorldId worldId, int stepIndex )
 {
-	// A demolition: a charge on every ground floor column, set off one column line after the other
-	// from one side, so the building leans that way as it comes down. The buildings go in turn.
+	// A demolition. Taking out the ground floor alone only drops a building by one story: it lands on
+	// the rubble as a damaged block. So, as in a real demolition, there are charges on the columns of
+	// the ground floor and of every few floors above it. They go off one column line after the other
+	// from one side, so the building leans that way as it comes down, and one charged floor after the
+	// other from the bottom up. The buildings go in turn.
 	float halfWidth = 0.5f * s_buildingDef.bayCountX * s_buildingDef.baySize;
 	float halfDepth = 0.5f * s_buildingDef.bayCountZ * s_buildingDef.baySize;
 	int lineCount = s_buildingDef.bayCountX + 1;
@@ -774,18 +781,26 @@ void StepBuildingCollapse( b3WorldId worldId, int stepIndex )
 			continue;
 		}
 
-		int elapsed = stepIndex - e_blastStep - i * e_buildingDelay;
-		if ( elapsed < 0 || elapsed % e_lineDelay != 0 || elapsed / e_lineDelay >= lineCount )
+		for ( int floor = 0; floor < s_buildingDef.floorCount; floor += e_chargeFloorSpacing )
 		{
-			continue;
-		}
+			int elapsed = stepIndex - e_blastStep - i * e_buildingDelay - ( floor / e_chargeFloorSpacing ) * e_floorDelay;
+			if ( elapsed < 0 || elapsed % e_lineDelay != 0 || elapsed / e_lineDelay >= lineCount )
+			{
+				continue;
+			}
 
-		int line = elapsed / e_lineDelay;
-		for ( int j = 0; j <= s_buildingDef.bayCountZ; ++j )
-		{
-			b3Vec3 offset = { -halfWidth + line * s_buildingDef.baySize, 1.2f, -halfDepth + j * s_buildingDef.baySize };
-			b3Pos position = b3ToPos( b3Add( s_buildingOrigins[i], offset ) );
-			ApplyBlast( worldId, position, 3.0f, 4.0e6f, 6000.0f );
+			int line = elapsed / e_lineDelay;
+			float height = floor * s_buildingDef.floorHeight + 1.2f;
+			for ( int j = 0; j <= s_buildingDef.bayCountZ; ++j )
+			{
+				b3Vec3 offset = { -halfWidth + line * s_buildingDef.baySize, height, -halfDepth + j * s_buildingDef.baySize };
+				b3Pos position = b3ToPos( b3Add( s_buildingOrigins[i], offset ) );
+				// The ground floor charges are large enough to take the walls between the columns
+				// along. The ones above only cut the columns, so the floors between two charged
+				// floors stay in one block until they land.
+				float radius = floor == 0 ? 3.0f : 1.5f;
+				ApplyBlast( worldId, position, radius, 4.0e6f, 6000.0f );
+			}
 		}
 	}
 }

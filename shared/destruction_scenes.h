@@ -112,7 +112,8 @@ b3StructureData* CreateBoulderStructure( float radius, float childSize, const b3
 void ApplyBlast( b3WorldId worldId, b3Pos position, float radius, float damage, float impulsePerArea );
 
 // The building collapse benchmark: several buildings on a ground plate. After a short rest charges
-// take out the ground floor columns of each building, line by line, and they come down in turn.
+// take out the columns of the ground floor and of every third floor above it, line by line and
+// floor by floor, and the buildings come down in turn.
 void GetBuildingCollapseCapacity( b3Capacity* capacity );
 void CreateBuildingCollapse( b3WorldId worldId );
 void StepBuildingCollapse( b3WorldId worldId, int stepIndex );
