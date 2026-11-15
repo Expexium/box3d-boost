@@ -194,6 +194,7 @@ set(SAMPLE_FILES
     sample_collision.cpp
     sample_compound.cpp
     sample_continuous.cpp
+    sample_destruction.cpp
     sample_determinism.cpp
     sample_events.cpp
     sample_geometry.cpp

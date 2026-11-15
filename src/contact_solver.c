@@ -139,7 +139,8 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 
 			// Only sample contact point normal velocity if needed.
 			bool haveRestitution = contact->restitution > 0.0f;
-			bool hitEvents = ( contact->flags & b3_simEnableHitEvent ) != 0;
+			// The destruction solver needs the approach velocity to measure impact energy.
+			bool hitEvents = ( contact->flags & ( b3_simEnableHitEvent | b3_simDestructionContact ) ) != 0;
 			bool sampleVelocity = haveRestitution || hitEvents;
 			anyRestitution = anyRestitution || haveRestitution;
 
@@ -830,6 +831,9 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 	bool hasHitEvents = taskContext->hasHitEvents;
 	float negHitThreshold = -world->hitEventThreshold;
 
+	// NULL when the world has no destruction, which also covers a stale contact flag in a replay world.
+	b3BitSet* destructionBitSet = world->destruction != NULL ? &taskContext->destructionBitSet : NULL;
+
 	int index = block.startIndex;
 	int endIndex = block.startIndex + block.count;
 
@@ -869,6 +873,11 @@ void b3StoreImpulses_Mesh( b3SolverBlock block, b3StepContext* context, int work
 
 			bool checkHitEvents = ( contact->flags & b3_simEnableHitEvent ) != 0;
 			bool flagged = false;
+
+			if ( destructionBitSet != NULL && ( contact->flags & b3_simDestructionContact ) != 0 )
+			{
+				b3SetBit( destructionBitSet, contact->contactId );
+			}
 
 			for ( int manifoldIndex = 0; manifoldIndex < manifoldCount; ++manifoldIndex )
 			{

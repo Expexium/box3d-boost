@@ -31,6 +31,7 @@ Box3D is a 3D physics engine for games.
 - Joint limits, motors, springs, and friction
 - Joint and contact forces
 - Body movement events and sleep notification
+- Destruction of pre-fractured structures driven by a stress solver
 
 ### System
 

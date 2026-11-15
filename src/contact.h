@@ -68,6 +68,9 @@ enum b3ContactFlags
 
 	// Enable speculative contact points
 	b3_enableSpeculativePoints = 0x01000000,
+
+	// One of the shapes is a fragment of a destructible, so the destruction solver wants the impulses.
+	b3_simDestructionContact = 0x02000000,
 };
 
 // A contact edge is used to connect bodies and contacts together

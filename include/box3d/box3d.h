@@ -5,6 +5,7 @@
 
 #include "base.h"
 #include "collision.h"
+#include "destruction.h"
 #include "id.h"
 #include "math_functions.h"
 #include "types.h"
@@ -1027,6 +1028,13 @@ B3_API bool b3Shape_ArePreSolveEventsEnabled( b3ShapeId shapeId );
 /// Enable contact hit events for this shape. Ignored for sensors.
 /// @see b3WorldDef.hitEventThreshold
 B3_API void b3Shape_EnableHitEvents( b3ShapeId shapeId, bool flag );
+
+/// Move a shape to another body in the same world without destroying and re-creating it. The shape
+/// keeps its local geometry, so it only stays in place if both bodies have the same transform.
+/// Contacts on the shape are destroyed and found again in the next time step. Only convex shapes
+/// may move to a body that is not static. This does not modify the mass properties.
+/// @see b3Body_ApplyMassFromShapes
+B3_API void b3Shape_SetBody( b3ShapeId shapeId, b3BodyId bodyId );
 
 /// Returns true if hit events are enabled
 B3_API bool b3Shape_AreHitEventsEnabled( b3ShapeId shapeId );

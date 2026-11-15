@@ -17,6 +17,7 @@
 #define B3_DEBUG_LINE_CAPACITY 64
 
 typedef struct b3Body b3Body;
+typedef struct b3Destruction b3Destruction;
 typedef struct b3Recording b3Recording;
 typedef struct b3Contact b3Contact;
 typedef struct b3Island b3Island;
@@ -91,6 +92,10 @@ typedef struct b3TaskContext
 
 	// Fast-path flag: true when this worker set at least one bit in hitEventBitSet this step.
 	bool hasHitEvents;
+
+	// These bits align with the contact id capacity and signal a solved contact that touches a
+	// fragment of a destructible. Only sized while the world has destruction.
+	b3BitSet destructionBitSet;
 
 	// Used to put islands to sleep
 	b3BitSet awakeIslandBitSet;
@@ -193,6 +198,10 @@ typedef struct b3World
 
 	// Name cache for shape and body names. This works with recording.
 	b3NameCache names;
+
+	// The destruction solver state. NULL until the first destructible is created, so worlds
+	// without destruction pay nothing. See destruction.h
+	b3Destruction* destruction;
 
 	// This is a dense array of sensor data.
 	b3Array( b3Sensor ) sensors;

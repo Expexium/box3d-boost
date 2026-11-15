@@ -6,6 +6,7 @@
 #endif
 
 #include "benchmarks.h"
+#include "destruction_scenes.h"
 #include "mesh_benchmark.h"
 #include "utils.h"
 
@@ -226,6 +227,7 @@ int main( int argc, char** argv )
 #endif
 
 	Benchmark benchmarks[] = {
+		{ "building_collapse", GetBuildingCollapseCapacity, CreateBuildingCollapse, DestroyBuildingCollapse, StepBuildingCollapse, 600 },
 		{ "convex_pile", GetConvexPileCapacity, CreateConvexPile, NULL, NULL, 500 },
 		{ "joint_grid", NULL, CreateJointGrid, NULL, NULL, 100 },
 		{ "junkyard", GetJunkyardCapacity, CreateJunkyard, NULL, StepJunkyard, 500 },

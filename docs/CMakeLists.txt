@@ -64,6 +64,7 @@ doxygen_add_docs(doc
                 "simulation.md"
                 "loose_ends.md"
                 "recording.md"
+                "destruction.md"
                 "large_worlds.md"
                 "character.md"
                 "reading.md"
