@@ -39,7 +39,14 @@
  */
 
 /// 64-bit structure version. Useful for validating serialized data.
-#define B3_STRUCTURE_VERSION 0x5D3A91C27E64B80Full
+#define B3_STRUCTURE_VERSION 0x5D3A91C27E64B810ull
+
+/// The most layers of clusters a structure can have above its support fragments.
+#define B3_MAX_CLUSTER_LAYERS 3
+
+/// The most strength layers a structure can have: one for each cluster layer, one for the bonds
+/// inside a cluster of the finest layer, and one for the inside of a fragment.
+#define B3_MAX_STRENGTH_LAYERS ( B3_MAX_CLUSTER_LAYERS + 2 )
 
 /// Material used by the destruction solver. Strengths are stresses in pascals (N/m^2). A bond takes
 /// no damage below its elastic limit, loses strength between the elastic and the fatal limit, and
@@ -123,6 +130,13 @@ typedef struct b3FragmentDef
 	/// Fix this fragment to the world. Only applies to support fragments.
 	bool isAnchored;
 
+	/// The cluster this fragment belongs to on each cluster layer, from the coarsest layer to the
+	/// finest. For a building the first layer could be the story and the second the wall, slab or
+	/// column. Two fragments are in the same cluster of a layer if they have the same index on it
+	/// and on every coarser layer. Used for support fragments, up to b3StructureDef::clusterLayerCount.
+	/// @see b3StructureDef::layerStrength
+	int clusters[B3_MAX_CLUSTER_LAYERS];
+
 	/// Use this to store application specific fragment data, for example a render bone index.
 	uint64_t userData;
 } b3FragmentDef;
@@ -178,6 +192,24 @@ typedef struct b3StructureDef
 
 	/// Shared surfaces smaller than this are not bonded, usually in m^2.
 	float minBondArea;
+
+	/// Number of cluster layers the fragments use, at most B3_MAX_CLUSTER_LAYERS. Zero for none.
+	int clusterLayerCount;
+
+	/// Strength of the connections on each layer, as a scale on the material: the stress limits of
+	/// the bonds and the energy it takes to break them. This is what decides how a structure comes
+	/// apart. With weak outer layers and strong inner ones it separates along the cluster borders
+	/// and the clusters survive as large pieces. With equal layers it breaks wherever the load is
+	/// the highest, down to single fragments.
+	/// - Entry i, for each cluster layer i: bonds between two clusters of that layer that share a
+	///   cluster on every coarser layer.
+	/// - The next entry: bonds between fragments inside a cluster of the finest layer. With no
+	///   cluster layers this is every bond.
+	/// - The entry after that: the inside of a fragment, which is the health that keeps it from
+	///   being crushed into its children.
+	/// Anchors to the world are on no layer.
+	/// @see b3Destructible_SetLayerStrength
+	float layerStrength[B3_MAX_STRENGTH_LAYERS];
 
 	/// Used internally to detect a valid definition. DO NOT SET.
 	int internalValue;
@@ -278,6 +310,10 @@ typedef struct b3StructureBond
 
 	/// b3StructureBondFlags
 	uint32_t flags;
+
+	/// The strength layer of the bond, B3_NULL_INDEX for a bond to the world.
+	/// @see b3StructureDef::layerStrength
+	int32_t layer;
 } b3StructureBond;
 
 /// A cooked structure. Created with b3CreateStructure.
@@ -338,6 +374,12 @@ typedef struct b3StructureData
 
 	/// Offset of the material array.
 	int32_t materialOffset;
+
+	/// Number of strength layers: the cluster layers plus two
+	int32_t strengthLayerCount;
+
+	/// Strength scale of each layer. @see b3StructureDef::layerStrength
+	float layerStrength[B3_MAX_STRENGTH_LAYERS];
 
 	/// Any padding must be explicit.
 } b3StructureData;
@@ -634,6 +676,10 @@ typedef struct b3BondEvent
 
 	/// Why the bond broke
 	b3BondBreakCause cause;
+
+	/// The strength layer of the bond, B3_NULL_INDEX for an anchor. A break on a coarse layer is a
+	/// large part coming off, a break on the finest layer is a crack inside a member.
+	int layer;
 } b3BondEvent;
 
 /// The destruction solver created a body.
@@ -707,6 +753,9 @@ typedef struct b3BondState
 
 	/// Has this bond broken?
 	bool isBroken;
+
+	/// The strength layer of the bond, B3_NULL_INDEX for an anchor
+	int layer;
 } b3BondState;
 
 /// Destruction profiling data. Times are in milliseconds.
@@ -801,6 +850,15 @@ B3_API void b3Destructible_SetStrengthScale( b3DestructibleId destructibleId, fl
 
 /// Get the strength scale
 B3_API float b3Destructible_GetStrengthScale( b3DestructibleId destructibleId );
+
+/// Set the strength of the connections on one layer of this destructible. This starts as the
+/// value in the structure and can be changed at any time, for example to let a building break
+/// into larger or smaller pieces. The last layer is the inside of the fragments.
+/// @see b3StructureDef::layerStrength
+B3_API void b3Destructible_SetLayerStrength( b3DestructibleId destructibleId, int layer, float scale );
+
+/// Get the strength of the connections on one layer of this destructible
+B3_API float b3Destructible_GetLayerStrength( b3DestructibleId destructibleId, int layer );
 
 /// Get the destructible that owns a shape. Returns a null id if the shape is not a fragment.
 /// This is useful when you get a shape id from a ray cast or an event.

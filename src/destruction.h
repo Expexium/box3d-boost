@@ -102,8 +102,13 @@ typedef struct b3DestructionBond
 
 	// b3BondFlags
 	uint8_t flags;
-	uint8_t padding;
+
+	// Strength layer of the bond, B3_ANCHOR_LAYER for a bond to the world
+	uint8_t layer;
 } b3DestructionBond;
+
+// Bonds to the world are on no strength layer
+#define B3_ANCHOR_LAYER 0xFF
 
 // A bond as the stress solver sees it. Kept small because the solver loops over these.
 typedef struct b3SolverBond
@@ -433,6 +438,10 @@ typedef struct b3Destructible
 
 	// Lowest toughness of the structure materials. Zero means some bonds break without energy.
 	float minToughness;
+
+	// Strength of the connections on each layer. The last one in use is the inside of the fragments.
+	float layerStrength[B3_MAX_STRENGTH_LAYERS];
+	int strengthLayerCount;
 	bool freezeSleepingDebris;
 	bool enableSleep;
 	bool enableBondEvents;
@@ -660,6 +669,20 @@ typedef struct b3Arena b3Arena;
 // Allocate the solver state for a piece with the given number of fragments and bonds.
 b3StressSystem* b3CreateStressSystem( int nodeCount, int bondCapacity );
 void b3UpdatePieceInert( b3World* world, b3Destructible* destructible, const b3DestructionPiece* piece );
+
+// Strength of a bond relative to its material: the scale of the destructible, the random variation
+// of the bond, and the layer the bond is on. This scales the stress limits and the energy to break it.
+static inline float b3GetBondStrength( const b3Destructible* destructible, const b3DestructionBond* bond )
+{
+	float layerStrength = bond->layer < B3_MAX_STRENGTH_LAYERS ? destructible->layerStrength[bond->layer] : 1.0f;
+	return destructible->strengthScale * bond->strength * layerStrength;
+}
+
+// Strength of the inside of the fragments, which scales the health that keeps them from being crushed
+static inline float b3GetCrushStrength( const b3Destructible* destructible )
+{
+	return destructible->strengthScale * destructible->layerStrength[destructible->strengthLayerCount - 1];
+}
 void b3DestroyStressSystem( b3StressSystem* system );
 int b3GetStressSystemByteCount( const b3StressSystem* system );
 

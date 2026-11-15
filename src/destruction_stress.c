@@ -180,7 +180,7 @@ int b3GetStressSystemByteCount( const b3StressSystem* system )
 b3BondLimits b3GetBondLimits( const b3Destructible* destructible, const b3DestructionBond* bond )
 {
 	const b3StructureMaterial* material = b3GetStructureMaterials( destructible->structure ) + bond->materialIndex;
-	float scale = destructible->strengthScale * bond->strength;
+	float scale = b3GetBondStrength( destructible, bond );
 
 	b3BondLimits limits;
 	limits.tensileElastic = scale * material->tensileElasticLimit;
@@ -1799,7 +1799,7 @@ static int b3SolveImpact( b3World* world, b3Destructible* destructible, b3Destru
 		}
 
 		// Energy to break what is left of the bond
-		float breakEnergy = destructible->strengthScale * bond->strength * materials[bond->materialIndex].toughness * bond->area;
+		float breakEnergy = b3GetBondStrength( destructible, bond ) * materials[bond->materialIndex].toughness * bond->area;
 		float cost = damage->damage * breakEnergy;
 		float share = damage->damage;
 		bool isFull = cost <= energy;

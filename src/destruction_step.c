@@ -599,7 +599,7 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 		float energy = settings->impactDamageScale * load->energy;
 		piece->impactEnergy += settings->impactFractureScale * load->energy;
 		load->energy = 0.0f;
-		float fullHealth = destructible->strengthScale * fragment->health;
+		float fullHealth = b3GetCrushStrength( destructible ) * fragment->health;
 		if ( energy > B3_MIN_IMPACT_HEALTH_FRACTION * fullHealth )
 		{
 			destructible->health[node] -= energy;
@@ -837,6 +837,7 @@ static void b3BreakBond( b3World* world, b3Destructible* destructible, int bondI
 		event.normal = b3RotateVector( transform.q, bond->normal );
 		event.area = bond->area0;
 		event.cause = cause;
+		event.layer = bond->layer == B3_ANCHOR_LAYER ? B3_NULL_INDEX : bond->layer;
 		b3Array_Push( destruction->bondEvents, event );
 	}
 }
@@ -2042,7 +2043,7 @@ static void b3QueueRadialDamage( b3Destructible* destructible, const b3RadialDam
 				}
 			}
 
-			float energy = destructible->strengthScale * bond->strength * materials[bond->materialIndex].toughness * bond->area0;
+			float energy = b3GetBondStrength( destructible, bond ) * materials[bond->materialIndex].toughness * bond->area0;
 			if ( energy <= 0.0f )
 			{
 				continue;

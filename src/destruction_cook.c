@@ -63,6 +63,11 @@ b3FragmentDef b3DefaultFragmentDef( void )
 b3StructureDef b3DefaultStructureDef( void )
 {
 	b3StructureDef def = { 0 };
+	for ( int i = 0; i < B3_MAX_STRENGTH_LAYERS; ++i )
+	{
+		def.layerStrength[i] = 1.0f;
+	}
+
 	def.generateBonds = true;
 	def.bondGap = 2.0f * B3_LINEAR_SLOP;
 	def.minBondArea = 4.0f * B3_LINEAR_SLOP * B3_LINEAR_SLOP;
@@ -490,6 +495,22 @@ b3StructureData* b3CreateStructure( const b3StructureDef* def )
 	if ( fragmentCount <= 0 || def->fragments == NULL )
 	{
 		return NULL;
+	}
+
+	int clusterLayerCount = def->clusterLayerCount;
+	if ( clusterLayerCount < 0 || clusterLayerCount > B3_MAX_CLUSTER_LAYERS )
+	{
+		B3_ASSERT( false );
+		return NULL;
+	}
+
+	for ( int i = 0; i < clusterLayerCount + 2; ++i )
+	{
+		if ( b3IsValidFloat( def->layerStrength[i] ) == false || def->layerStrength[i] <= 0.0f )
+		{
+			B3_ASSERT( false );
+			return NULL;
+		}
 	}
 
 	// Validate the fragments and count the hulls
@@ -927,6 +948,30 @@ b3StructureData* b3CreateStructure( const b3StructureDef* def )
 
 	qsort( bonds, bondCount, sizeof( b3StructureBond ), b3CompareBonds );
 
+	// The layer of a bond is the coarsest cluster layer on which its two fragments part ways. If
+	// they never do, the bond is inside a cluster of the finest layer.
+	for ( int i = 0; i < bondCount; ++i )
+	{
+		b3StructureBond* bond = bonds + i;
+		if ( bond->fragmentB == B3_NULL_INDEX )
+		{
+			bond->layer = B3_NULL_INDEX;
+			continue;
+		}
+
+		const int* clustersA = def->fragments[bond->fragmentA].clusters;
+		const int* clustersB = def->fragments[bond->fragmentB].clusters;
+		bond->layer = clusterLayerCount;
+		for ( int j = 0; j < clusterLayerCount; ++j )
+		{
+			if ( clustersA[j] != clustersB[j] )
+			{
+				bond->layer = j;
+				break;
+			}
+		}
+	}
+
 	// Health: the energy that crushes a fragment
 	for ( int i = 0; i < fragmentCount; ++i )
 	{
@@ -1024,6 +1069,11 @@ b3StructureData* b3CreateStructure( const b3StructureDef* def )
 		structure->hullOffset = hullOffset;
 		structure->materialCount = materialCount;
 		structure->materialOffset = materialOffset;
+		structure->strengthLayerCount = clusterLayerCount + 2;
+		for ( int i = 0; i < B3_MAX_STRENGTH_LAYERS; ++i )
+		{
+			structure->layerStrength[i] = i < clusterLayerCount + 2 ? def->layerStrength[i] : 1.0f;
+		}
 
 		char* base = (char*)structure;
 
@@ -1230,12 +1280,26 @@ const b3StructureData* b3ValidateStructure( const uint8_t* bytes, int byteCount 
 		}
 	}
 
+	if ( structure->strengthLayerCount < 2 || structure->strengthLayerCount > B3_MAX_STRENGTH_LAYERS )
+	{
+		return NULL;
+	}
+
+	for ( int i = 0; i < structure->strengthLayerCount; ++i )
+	{
+		if ( b3IsValidFloat( structure->layerStrength[i] ) == false || structure->layerStrength[i] <= 0.0f )
+		{
+			return NULL;
+		}
+	}
+
 	const b3StructureBond* bonds = b3GetStructureBonds( structure );
 	for ( int i = 0; i < structure->bondCount; ++i )
 	{
 		const b3StructureBond* bond = bonds + i;
 		bool valid = bond->fragmentA >= 0 && bond->fragmentA < structure->fragmentCount && bond->fragmentB >= B3_NULL_INDEX &&
-					 bond->fragmentB < structure->fragmentCount && bond->area > 0.0f;
+					 bond->fragmentB < structure->fragmentCount && bond->area > 0.0f && bond->layer >= B3_NULL_INDEX &&
+					 bond->layer < structure->strengthLayerCount - 1;
 		if ( valid == false )
 		{
 			return NULL;

@@ -52,6 +52,9 @@ typedef struct FractureDef
 
 	// Fix the fragments to the world
 	bool isAnchored;
+
+	// The cluster the fragments belong to on each cluster layer. See b3FragmentDef.
+	int clusters[B3_MAX_CLUSTER_LAYERS];
 } FractureDef;
 
 FractureDef DefaultFractureDef( void );
@@ -63,6 +66,24 @@ void AddFracturedBox( DestructionBuilder* builder, b3Transform transform, b3Vec3
 int AddFragment( DestructionBuilder* builder, const b3HullData* hull, int parentIndex, int materialIndex, bool isAnchored );
 
 int GetFragmentCount( const DestructionBuilder* builder );
+
+// Is this a support fragment, as opposed to the debris one crumbles into?
+bool IsSupportFragment( const DestructionBuilder* builder, int fragmentIndex );
+
+// Center of a fragment in structure space
+b3Vec3 GetFragmentCenter( const DestructionBuilder* builder, int fragmentIndex );
+
+// Put a fragment into a cluster on one cluster layer
+void SetFragmentCluster( DestructionBuilder* builder, int fragmentIndex, int layer, int cluster );
+
+// Put the support fragments added since firstFragment into clusters on one cluster layer, by the
+// cell of a grid their center lies in. A cell size of zero along an axis makes one cell of that axis.
+// Cuts a wall into panels or a tower into segments.
+void ClusterFragmentsByGrid( DestructionBuilder* builder, int firstFragment, int layer, b3Vec3 cellSize );
+
+// Set the number of cluster layers and the strength of the connections on each strength layer.
+// The array holds two more entries than there are cluster layers. See b3StructureDef::layerStrength.
+void SetDestructionLayers( DestructionBuilder* builder, int clusterLayerCount, const float* layerStrength );
 
 // Cook everything added so far. The caller owns the result and frees it with b3DestroyStructure.
 b3StructureData* BuildStructure( DestructionBuilder* builder );
@@ -89,6 +110,10 @@ typedef struct BuildingDef
 
 	FractureDef fracture;
 	b3StructureMaterial material;
+
+	// Strength of the connections between stories, between the members of a story (a column, a
+	// wall panel, a bay of the slab), between the fragments of a member, and inside a fragment
+	float layerStrength[B3_MAX_STRENGTH_LAYERS];
 	uint32_t seed;
 } BuildingDef;
 

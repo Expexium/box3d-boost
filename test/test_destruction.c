@@ -1354,6 +1354,265 @@ static int DestroyFragmentShapeTest( void )
 	return 0;
 }
 
+// The layer of a bond is the coarsest cluster layer on which its two fragments are in different
+// clusters, and the strength of a layer reaches the bonds and the fragments of a destructible.
+static int LayerCookTest( void )
+{
+	DestructionBuilder* builder = CreateDestructionBuilder( 17 );
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+
+	// Two panels side by side, each a cluster
+	b3Vec3 halfExtents = { 1.0f, 1.0f, 0.15f };
+	b3Transform left = { { -1.0f, 1.0f, 0.0f }, b3Quat_identity };
+	b3Transform right = { { 1.0f, 1.0f, 0.0f }, b3Quat_identity };
+	fracture.clusters[0] = 0;
+	AddFracturedBox( builder, left, halfExtents, &fracture );
+	int leftCount = GetFragmentCount( builder );
+	fracture.clusters[0] = 1;
+	AddFracturedBox( builder, right, halfExtents, &fracture );
+
+	float layerStrength[3] = { 0.5f, 2.0f, 3.0f };
+	SetDestructionLayers( builder, 1, layerStrength );
+	b3StructureData* structure = BuildStructure( builder );
+
+	// Clustering by a grid of two meter cells gives the same two clusters
+	ClusterFragmentsByGrid( builder, 0, 0, (b3Vec3){ 2.0f, 0.0f, 0.0f } );
+	b3StructureData* gridStructure = BuildStructure( builder );
+	DestroyDestructionBuilder( builder );
+	ENSURE( structure != NULL && gridStructure != NULL );
+	ENSURE( gridStructure->bondCount == structure->bondCount );
+	for ( int i = 0; i < structure->bondCount; ++i )
+	{
+		ENSURE( b3GetStructureBonds( gridStructure )[i].layer == b3GetStructureBonds( structure )[i].layer );
+	}
+
+	b3DestroyStructure( gridStructure );
+	ENSURE( structure->strengthLayerCount == 3 );
+	ENSURE( structure->layerStrength[0] == 0.5f && structure->layerStrength[1] == 2.0f && structure->layerStrength[2] == 3.0f );
+	ENSURE( b3ValidateStructure( (const uint8_t*)structure, structure->byteCount ) == structure );
+
+	const b3StructureBond* bonds = b3GetStructureBonds( structure );
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+	int betweenCount = 0, insideCount = 0;
+	for ( int i = 0; i < structure->bondCount; ++i )
+	{
+		bool isLeftA = bonds[i].fragmentA < leftCount;
+		bool isLeftB = bonds[i].fragmentB < leftCount;
+		ENSURE( bonds[i].layer == ( isLeftA == isLeftB ? 1 : 0 ) );
+		betweenCount += bonds[i].layer == 0;
+		insideCount += bonds[i].layer == 1;
+	}
+
+	// The panels are four cells high, so about four bonds join them
+	ENSURE( betweenCount >= 2 && betweenCount <= 8 );
+	ENSURE( insideCount > 4 * betweenCount );
+
+	b3WorldId worldId = CreateTestWorld( 1 );
+	CreateGround( worldId );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+
+	ENSURE( b3Destructible_GetLayerStrength( destructibleId, 0 ) == 0.5f );
+	ENSURE( b3Destructible_GetLayerStrength( destructibleId, 1 ) == 2.0f );
+	ENSURE( b3Destructible_GetLayerStrength( destructibleId, 2 ) == 3.0f );
+
+	// The structure bonds come first and keep their layer. The anchors to the ground follow and are
+	// on no layer.
+	int bondCount = b3Destructible_GetBondCount( destructibleId );
+	ENSURE( bondCount > structure->bondCount );
+	for ( int i = 0; i < bondCount; ++i )
+	{
+		b3BondState state = b3Destructible_GetBondState( destructibleId, i );
+		ENSURE( state.layer == ( i < structure->bondCount ? bonds[i].layer : B3_NULL_INDEX ) );
+	}
+
+	// The last layer is the inside of the fragments
+	int target = FindFragment( structure, (b3Vec3){ -1.0f, 1.0f, 0.0f } );
+	ENSURE( fragments[target].health > 0.0f );
+	ENSURE( b3AbsFloat( b3Destructible_GetFragmentHealth( destructibleId, target ) - 3.0f * fragments[target].health ) < 1.0e-3f * fragments[target].health );
+
+	b3Destructible_SetLayerStrength( destructibleId, 2, 6.0f );
+	ENSURE( b3Destructible_GetLayerStrength( destructibleId, 2 ) == 6.0f );
+	ENSURE( b3AbsFloat( b3Destructible_GetFragmentHealth( destructibleId, target ) - 6.0f * fragments[target].health ) < 1.0e-3f * fragments[target].health );
+
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// A cantilever of eight cells in two clusters. It carries itself until one layer is made weak, and
+// then it breaks where that layer is: at the border between the clusters, or at the root inside
+// the first cluster, where the bending is the largest.
+static int LayerBreakTest( void )
+{
+	b3StructureMaterial material = b3DefaultStructureMaterial();
+	material.strengthVariation = 0.0f;
+
+	enum { cellCount = 8 };
+	const float cellLength = 0.375f;
+
+	DestructionBuilder* builder = CreateDestructionBuilder( 1 );
+	AddDestructionMaterial( builder, &material );
+	for ( int i = 0; i < cellCount; ++i )
+	{
+		b3Vec3 center = { ( (float)i + 0.5f ) * cellLength, 0.0f, 0.0f };
+		b3BoxHull box = b3MakeOffsetBoxHull( 0.5f * cellLength, 0.2f, 0.2f, center );
+		int index = AddFragment( builder, &box.base, B3_NULL_INDEX, 0, i == 0 );
+		SetFragmentCluster( builder, index, 0, i < cellCount / 2 ? 0 : 1 );
+	}
+
+	float layerStrength[3] = { 1.0f, 1.0f, 1.0f };
+	SetDestructionLayers( builder, 1, layerStrength );
+	b3StructureData* structure = BuildStructure( builder );
+	DestroyDestructionBuilder( builder );
+	ENSURE( structure != NULL );
+
+	for ( int pass = 0; pass < 2; ++pass )
+	{
+		b3WorldId worldId = CreateTestWorld( 1 );
+
+		b3DestructibleDef def = b3DefaultDestructibleDef();
+		def.structure = structure;
+		def.position = (b3Pos){ 0.0f, 10.0f, 0.0f };
+		b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+		int bondCount = b3Destructible_GetBondCount( destructibleId );
+		b3BodyId anchorBodyId = b3Destructible_GetFragmentBody( destructibleId, 0 );
+
+		// It holds as built
+		StepWorld( worldId, 60 );
+		ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == bondCount );
+
+		if ( pass == 0 )
+		{
+			// Weak between the clusters: the outer cluster drops off in one piece
+			b3Destructible_SetLayerStrength( destructibleId, 0, 0.1f );
+			StepWorld( worldId, 30 );
+
+			ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == bondCount - 1 );
+			for ( int i = 0; i < cellCount; ++i )
+			{
+				bool isHeld = B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, i ), anchorBodyId );
+				ENSURE( isHeld == ( i < cellCount / 2 ) );
+			}
+
+			ENSURE( B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, cellCount / 2 ),
+								  b3Destructible_GetFragmentBody( destructibleId, cellCount - 1 ) ) );
+		}
+		else
+		{
+			// Weak inside the clusters: the beam snaps at the root and the rest drops off in one
+			// piece, the border between the clusters included
+			b3Destructible_SetLayerStrength( destructibleId, 1, 0.5f );
+			StepWorld( worldId, 30 );
+
+			ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == bondCount - 1 );
+			ENSURE( B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, 0 ), anchorBodyId ) );
+			for ( int i = 1; i < cellCount; ++i )
+			{
+				ENSURE( B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, i ), b3Destructible_GetFragmentBody( destructibleId, 1 ) ) );
+			}
+
+			ENSURE( B3_ID_EQUALS( b3Destructible_GetFragmentBody( destructibleId, 1 ), anchorBodyId ) == false );
+		}
+
+		b3DestroyWorld( worldId );
+	}
+
+	b3DestroyStructure( structure );
+	return 0;
+}
+
+// Drop a plate of four panels onto a ridge and return the number of support fragments in the
+// largest piece that is left, and the number of support fragments that were not crushed.
+static int RunPlateDrop( const float* layerStrength, int* survivorCount )
+{
+	DestructionBuilder* builder = CreateDestructionBuilder( 29 );
+	FractureDef fracture = DefaultFractureDef();
+	fracture.cellSize = 0.5f;
+	fracture.childSize = 0.25f;
+
+	// Four panels of two by two meters, each a cluster
+	b3Vec3 halfExtents = { 1.0f, 0.15f, 1.0f };
+	for ( int i = 0; i < 4; ++i )
+	{
+		b3Transform transform = { { i % 2 == 0 ? -1.0f : 1.0f, 0.0f, i / 2 == 0 ? -1.0f : 1.0f }, b3Quat_identity };
+		fracture.clusters[0] = i;
+		AddFracturedBox( builder, transform, halfExtents, &fracture );
+	}
+
+	SetDestructionLayers( builder, 1, layerStrength );
+	b3StructureData* structure = BuildStructure( builder );
+	DestroyDestructionBuilder( builder );
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+
+	b3WorldId worldId = CreateTestWorld( 1 );
+	b3BodyId groundId = CreateGround( worldId );
+
+	// A ridge across the plate, off the border between the panels
+	b3BoxHull ridge = b3MakeOffsetBoxHull( 0.2f, 0.5f, 3.0f, (b3Vec3){ 0.5f, 1.5f, 0.0f } );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundId, &shapeDef, &ridge.base );
+
+	b3DestructibleDef def = b3DefaultDestructibleDef();
+	def.structure = structure;
+	def.position = (b3Pos){ 0.0f, 9.0f, 0.0f };
+	def.anchorToStatic = false;
+	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+
+	StepWorld( worldId, 240 );
+
+	b3BodyId bodies[1024];
+	b3ShapeId shapes[256];
+	int bodyCount = b3Destructible_GetBodies( destructibleId, bodies, 1024 );
+	int largest = 0;
+	int survivors = 0;
+	for ( int i = 0; i < bodyCount; ++i )
+	{
+		int shapeCount = b3Body_GetShapes( bodies[i], shapes, 256 );
+		int size = 0;
+		for ( int j = 0; j < shapeCount; ++j )
+		{
+			int fragmentIndex = b3Shape_GetFragmentIndex( shapes[j] );
+			if ( fragmentIndex != B3_NULL_INDEX && fragments[fragmentIndex].parent == B3_NULL_INDEX )
+			{
+				size += 1;
+			}
+		}
+
+		largest = b3MaxInt( largest, size );
+		survivors += size;
+	}
+
+	*survivorCount = survivors;
+	b3DestroyWorld( worldId );
+	b3DestroyStructure( structure );
+	return largest;
+}
+
+// The layers decide what a structure breaks into. The same plate falls on the same ridge twice.
+// With equal layers it breaks up small and many fragments are crushed. With strong bonds inside the
+// panels and tough fragments the panels come through whole.
+static int LayerChunkTest( void )
+{
+	float equal[3] = { 1.0f, 1.0f, 1.0f };
+	float strongPanels[3] = { 1.0f, 30.0f, 30.0f };
+
+	int equalSurvivors = 0, panelSurvivors = 0;
+	int equalLargest = RunPlateDrop( equal, &equalSurvivors );
+	int panelLargest = RunPlateDrop( strongPanels, &panelSurvivors );
+
+	// A panel has sixteen fragments. The border between the panels is no stronger than before, so
+	// no piece is larger than a panel.
+	ENSURE( panelLargest >= 2 * equalLargest );
+	ENSURE( panelLargest <= 16 );
+	ENSURE( panelSurvivors >= equalSurvivors );
+	return 0;
+}
+
 // A recording of a collapse must replay to the same state. The replay world has no destruction solver:
 // everything the solver did to the world is in the recording as ordinary operations.
 static int CollapseRecordingTest( void )
@@ -1776,6 +2035,9 @@ int DestructionTest( void )
 	RUN_SUBTEST( ApplyImpulseTest );
 	RUN_SUBTEST( RadialDamageTest );
 	RUN_SUBTEST( DestroyFragmentShapeTest );
+	RUN_SUBTEST( LayerCookTest );
+	RUN_SUBTEST( LayerBreakTest );
+	RUN_SUBTEST( LayerChunkTest );
 	RUN_SUBTEST( CollapseDeterminismTest );
 	RUN_SUBTEST( CollapseRecordingTest );
 	RUN_SUBTEST( BlastedWallTest );

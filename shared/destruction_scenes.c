@@ -9,6 +9,7 @@
 
 #include <assert.h>
 #include <float.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,7 @@ typedef struct BuilderFragment
 	int parentIndex;
 	int materialIndex;
 	bool isAnchored;
+	int clusters[B3_MAX_CLUSTER_LAYERS];
 } BuilderFragment;
 
 struct DestructionBuilder
@@ -40,6 +42,8 @@ struct DestructionBuilder
 	int capacity;
 	b3StructureMaterial materials[e_maxMaterials];
 	int materialCount;
+	int clusterLayerCount;
+	float layerStrength[B3_MAX_STRENGTH_LAYERS];
 	uint32_t seed;
 };
 
@@ -58,6 +62,11 @@ DestructionBuilder* CreateDestructionBuilder( uint32_t seed )
 {
 	DestructionBuilder* builder = calloc( 1, sizeof( DestructionBuilder ) );
 	builder->seed = seed != 0 ? seed : 1;
+	for ( int i = 0; i < B3_MAX_STRENGTH_LAYERS; ++i )
+	{
+		builder->layerStrength[i] = 1.0f;
+	}
+
 	return builder;
 }
 
@@ -113,6 +122,7 @@ static int AddOwnedFragment( DestructionBuilder* builder, b3HullData* hull, b3Tr
 	fragment->parentIndex = parentIndex;
 	fragment->materialIndex = materialIndex;
 	fragment->isAnchored = isAnchored;
+	memset( fragment->clusters, 0, sizeof( fragment->clusters ) );
 	builder->count += 1;
 	return builder->count - 1;
 }
@@ -125,6 +135,50 @@ int AddFragment( DestructionBuilder* builder, const b3HullData* hull, int parent
 int GetFragmentCount( const DestructionBuilder* builder )
 {
 	return builder->count;
+}
+
+bool IsSupportFragment( const DestructionBuilder* builder, int fragmentIndex )
+{
+	return builder->fragments[fragmentIndex].parentIndex == B3_NULL_INDEX;
+}
+
+b3Vec3 GetFragmentCenter( const DestructionBuilder* builder, int fragmentIndex )
+{
+	const BuilderFragment* fragment = builder->fragments + fragmentIndex;
+	b3Vec3 center = b3Lerp( fragment->hull->aabb.lowerBound, fragment->hull->aabb.upperBound, 0.5f );
+	return b3TransformPoint( fragment->transform, center );
+}
+
+void SetFragmentCluster( DestructionBuilder* builder, int fragmentIndex, int layer, int cluster )
+{
+	builder->fragments[fragmentIndex].clusters[layer] = cluster;
+}
+
+void ClusterFragmentsByGrid( DestructionBuilder* builder, int firstFragment, int layer, b3Vec3 cellSize )
+{
+	for ( int i = firstFragment; i < builder->count; ++i )
+	{
+		if ( IsSupportFragment( builder, i ) == false )
+		{
+			continue;
+		}
+
+		// Ten bits per axis, with the origin in the middle of the range
+		b3Vec3 center = GetFragmentCenter( builder, i );
+		int x = cellSize.x > 0.0f ? b3ClampInt( (int)floorf( center.x / cellSize.x ) + 512, 0, 1023 ) : 0;
+		int y = cellSize.y > 0.0f ? b3ClampInt( (int)floorf( center.y / cellSize.y ) + 512, 0, 1023 ) : 0;
+		int z = cellSize.z > 0.0f ? b3ClampInt( (int)floorf( center.z / cellSize.z ) + 512, 0, 1023 ) : 0;
+		builder->fragments[i].clusters[layer] = x | ( y << 10 ) | ( z << 20 );
+	}
+}
+
+void SetDestructionLayers( DestructionBuilder* builder, int clusterLayerCount, const float* layerStrength )
+{
+	builder->clusterLayerCount = clusterLayerCount;
+	for ( int i = 0; i < clusterLayerCount + 2; ++i )
+	{
+		builder->layerStrength[i] = layerStrength[i];
+	}
 }
 
 bool SplitHull( const b3HullData* hull, b3Plane plane, b3HullData** below, b3HullData** above )
@@ -396,6 +450,7 @@ void AddFracturedBox( DestructionBuilder* builder, b3Transform transform, b3Vec3
 		}
 
 		int parentIndex = AddOwnedFragment( builder, cell, transform, B3_NULL_INDEX, def->materialIndex, def->isAnchored );
+		memcpy( builder->fragments[parentIndex].clusters, def->clusters, sizeof( def->clusters ) );
 
 		if ( children.count > 1 )
 		{
@@ -438,11 +493,18 @@ b3StructureData* BuildStructure( DestructionBuilder* builder )
 		fragmentDef->materialIndex = fragment->materialIndex;
 		fragmentDef->isAnchored = fragment->isAnchored;
 		fragmentDef->userData = (uint64_t)i;
+		memcpy( fragmentDef->clusters, fragment->clusters, sizeof( fragment->clusters ) );
 	}
 
 	b3StructureDef def = b3DefaultStructureDef();
 	def.fragments = fragmentDefs;
 	def.fragmentCount = builder->count;
+	def.clusterLayerCount = builder->clusterLayerCount;
+	for ( int i = 0; i < builder->clusterLayerCount + 2; ++i )
+	{
+		def.layerStrength[i] = builder->layerStrength[i];
+	}
+
 	if ( builder->materialCount > 0 )
 	{
 		def.materials = builder->materials;
@@ -470,6 +532,11 @@ BuildingDef DefaultBuildingDef( void )
 	def.fracture.cellSize = 1.0f;
 	def.fracture.childSize = 0.5f;
 	def.material = b3DefaultStructureMaterial();
+	for ( int i = 0; i < B3_MAX_STRENGTH_LAYERS; ++i )
+	{
+		def.layerStrength[i] = 1.0f;
+	}
+
 	def.seed = 1234;
 	return def;
 }
@@ -481,8 +548,8 @@ static void AddBox( DestructionBuilder* builder, b3Vec3 center, b3Vec3 halfExten
 }
 
 // A wall panel between two columns. Every other panel has a window, and the ground floor has a door.
-static void AddWallPanel( DestructionBuilder* builder, const BuildingDef* def, b3Vec3 center, float length, float height,
-						  bool alongX, int style )
+static void AddWallPanel( DestructionBuilder* builder, const BuildingDef* def, const FractureDef* fracture, b3Vec3 center, float length,
+						  float height, bool alongX, int style )
 {
 	float thickness = 0.5f * def->wallThickness;
 	float halfLength = 0.5f * length;
@@ -492,7 +559,7 @@ static void AddWallPanel( DestructionBuilder* builder, const BuildingDef* def, b
 	{
 		// Solid
 		b3Vec3 half = alongX ? (b3Vec3){ halfLength, halfHeight, thickness } : (b3Vec3){ thickness, halfHeight, halfLength };
-		AddBox( builder, center, half, &def->fracture );
+		AddBox( builder, center, half, fracture );
 		return;
 	}
 
@@ -511,12 +578,12 @@ static void AddWallPanel( DestructionBuilder* builder, const BuildingDef* def, b
 	b3Vec3 sillCenter = center;
 	sillCenter.y = bottom + 0.5f * sill;
 	b3Vec3 sillHalf = alongX ? (b3Vec3){ halfLength, 0.5f * sill, thickness } : (b3Vec3){ thickness, 0.5f * sill, halfLength };
-	AddBox( builder, sillCenter, sillHalf, &def->fracture );
+	AddBox( builder, sillCenter, sillHalf, fracture );
 
 	b3Vec3 lintelCenter = center;
 	lintelCenter.y = bottom + height - 0.5f * lintel;
 	b3Vec3 lintelHalf = alongX ? (b3Vec3){ halfLength, 0.5f * lintel, thickness } : (b3Vec3){ thickness, 0.5f * lintel, halfLength };
-	AddBox( builder, lintelCenter, lintelHalf, &def->fracture );
+	AddBox( builder, lintelCenter, lintelHalf, fracture );
 
 	float pierHeight = height - sill - lintel;
 	for ( int side = -1; side <= 1; side += 2 )
@@ -534,7 +601,7 @@ static void AddWallPanel( DestructionBuilder* builder, const BuildingDef* def, b
 		}
 
 		b3Vec3 pierHalf = alongX ? (b3Vec3){ 0.5f * pier, 0.5f * pierHeight, thickness } : (b3Vec3){ thickness, 0.5f * pierHeight, 0.5f * pier };
-		AddBox( builder, pierCenter, pierHalf, &def->fracture );
+		AddBox( builder, pierCenter, pierHalf, fracture );
 	}
 }
 
@@ -542,6 +609,10 @@ b3StructureData* CreateBuildingStructure( const BuildingDef* def )
 {
 	DestructionBuilder* builder = CreateDestructionBuilder( def->seed );
 	AddDestructionMaterial( builder, &def->material );
+
+	// Two cluster layers: the story, and the member within the story. A member is a column, a wall
+	// panel, or one bay of the floor slab.
+	SetDestructionLayers( builder, 2, def->layerStrength );
 
 	float width = def->bayCountX * def->baySize;
 	float depth = def->bayCountZ * def->baySize;
@@ -551,6 +622,9 @@ b3StructureData* CreateBuildingStructure( const BuildingDef* def )
 	for ( int floor = 0; floor < def->floorCount; ++floor )
 	{
 		float base = floor * def->floorHeight;
+		FractureDef fracture = def->fracture;
+		fracture.clusters[0] = floor;
+		int memberCount = 0;
 
 		// Columns on the grid lines
 		for ( int i = 0; i <= def->bayCountX; ++i )
@@ -559,7 +633,8 @@ b3StructureData* CreateBuildingStructure( const BuildingDef* def )
 			{
 				b3Vec3 center = { -0.5f * width + i * def->baySize, base + 0.5f * columnHeight, -0.5f * depth + j * def->baySize };
 				b3Vec3 half = { columnHalf, 0.5f * columnHeight, columnHalf };
-				AddBox( builder, center, half, &def->fracture );
+				fracture.clusters[1] = memberCount++;
+				AddBox( builder, center, half, &fracture );
 			}
 		}
 
@@ -574,23 +649,42 @@ b3StructureData* CreateBuildingStructure( const BuildingDef* def )
 				float x = -0.5f * width + ( i + 0.5f ) * def->baySize;
 				int style = ( i + floor ) % 2;
 				int frontStyle = ( floor == 0 && i == def->bayCountX / 2 ) ? 2 : style;
-				AddWallPanel( builder, def, (b3Vec3){ x, wallY, -0.5f * depth }, panelLength, columnHeight, true, frontStyle );
-				AddWallPanel( builder, def, (b3Vec3){ x, wallY, 0.5f * depth }, panelLength, columnHeight, true, style );
+				fracture.clusters[1] = memberCount++;
+				AddWallPanel( builder, def, &fracture, (b3Vec3){ x, wallY, -0.5f * depth }, panelLength, columnHeight, true, frontStyle );
+				fracture.clusters[1] = memberCount++;
+				AddWallPanel( builder, def, &fracture, (b3Vec3){ x, wallY, 0.5f * depth }, panelLength, columnHeight, true, style );
 			}
 
 			for ( int j = 0; j < def->bayCountZ; ++j )
 			{
 				float z = -0.5f * depth + ( j + 0.5f ) * def->baySize;
 				int style = ( j + floor + 1 ) % 2;
-				AddWallPanel( builder, def, (b3Vec3){ -0.5f * width, wallY, z }, panelLength, columnHeight, false, style );
-				AddWallPanel( builder, def, (b3Vec3){ 0.5f * width, wallY, z }, panelLength, columnHeight, false, style );
+				fracture.clusters[1] = memberCount++;
+				AddWallPanel( builder, def, &fracture, (b3Vec3){ -0.5f * width, wallY, z }, panelLength, columnHeight, false, style );
+				fracture.clusters[1] = memberCount++;
+				AddWallPanel( builder, def, &fracture, (b3Vec3){ 0.5f * width, wallY, z }, panelLength, columnHeight, false, style );
 			}
 		}
 
-		// The floor slab rests on the columns and the walls
+		// The floor slab rests on the columns and the walls. It is cut as one plate, and each bay of
+		// it is a member.
 		b3Vec3 slabCenter = { 0.0f, base + columnHeight + 0.5f * def->slabThickness, 0.0f };
 		b3Vec3 slabHalf = { 0.5f * width + columnHalf, 0.5f * def->slabThickness, 0.5f * depth + columnHalf };
-		AddBox( builder, slabCenter, slabHalf, &def->fracture );
+		int firstSlabFragment = GetFragmentCount( builder );
+		AddBox( builder, slabCenter, slabHalf, &fracture );
+
+		for ( int i = firstSlabFragment; i < GetFragmentCount( builder ); ++i )
+		{
+			if ( IsSupportFragment( builder, i ) == false )
+			{
+				continue;
+			}
+
+			b3Vec3 center = GetFragmentCenter( builder, i );
+			int bayX = b3ClampInt( (int)( ( center.x + 0.5f * width ) / def->baySize ), 0, def->bayCountX - 1 );
+			int bayZ = b3ClampInt( (int)( ( center.z + 0.5f * depth ) / def->baySize ), 0, def->bayCountZ - 1 );
+			SetFragmentCluster( builder, i, 1, memberCount + bayX * def->bayCountZ + bayZ );
+		}
 	}
 
 	b3StructureData* structure = BuildStructure( builder );
@@ -737,6 +831,14 @@ void CreateBuildingCollapse( b3WorldId worldId )
 	}
 
 	s_buildingDef = DefaultBuildingDef();
+
+	// With every layer equal a building this size grinds itself down to single fragments and
+	// debris. Stronger bonds inside the members and tougher fragments let wall panels, slab bays
+	// and parts of them come through, which gives rubble of mixed sizes.
+	s_buildingDef.layerStrength[0] = 1.0f;
+	s_buildingDef.layerStrength[1] = 1.0f;
+	s_buildingDef.layerStrength[2] = 10.0f;
+	s_buildingDef.layerStrength[3] = 5.0f;
 	s_buildingDef.floorCount = BENCHMARK_DEBUG ? b3MinInt( 2, s_buildingFloorCount ) : s_buildingFloorCount;
 	s_buildingStructure = CreateBuildingStructure( &s_buildingDef );
 

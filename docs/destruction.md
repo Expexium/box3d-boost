@@ -106,7 +106,50 @@ and shear, a relative stiffness, the toughness, the creep time, and a random var
 bond strength. The default is plain concrete. Start from real strengths and scale them for the
 game. Bonds take the material of their fragments.
 
-`b3Destructible_SetStrengthScale` scales the strength of a destructible at run time.
+`b3Destructible_SetStrengthScale` scales the strength of a whole destructible at run time, and
+the layers described below scale parts of it.
+
+## Layers
+
+How a structure comes apart is decided by how strong its connections are on each layer.
+
+Put the support fragments into clusters, on up to three cluster layers from coarse to fine. For
+a building the first layer could be the story and the second the member: a column, a wall panel,
+a bay of the floor slab. Each fragment names its cluster on every layer in
+`b3FragmentDef::clusters`.
+
+Every bond then lies on one strength layer: the coarsest cluster layer on which its two fragments
+are in different clusters. A bond between two stories is on the first layer, a bond between a
+wall and a slab of the same story on the second, and a bond between two fragments of the same
+wall on the layer after that. The last layer is the inside of a fragment, which is the health
+that keeps it from being crushed into its children.
+
+`b3StructureDef::layerStrength` gives each layer a scale on the material. It applies to the
+stress limits of the bonds and to the energy it takes to break them, so it covers slow overload,
+impacts and damage alike. `b3Destructible_SetLayerStrength` changes it for one destructible at
+any time.
+
+- With equal layers a structure breaks wherever the load is the highest. A large collapse then
+  grinds it down to single fragments and debris.
+- With strong inner layers it separates along the cluster borders and the clusters come through
+  as large pieces: whole wall panels and slab bays.
+- With a strong last layer the fragments are not crushed, so there is less debris.
+- Strong outer layers as well give pieces that span several clusters.
+
+For example, the same eight story building, demolished the same way, with the layers for
+stories, members, inside members and inside fragments set to:
+
+| Layers | Fragments crushed | Single fragments | In pieces of 9 or more |
+|---|---|---|---|
+| 1, 1, 1, 1 | 60% | 84% | 2% |
+| 1, 1, 10, 5 | 29% | 33% | 21% |
+| 1, 1, 20, 20 | 20% | 21% | 43% |
+| 1, 20, 20, 20 | 21% | 20% | 47% |
+
+The last two columns are shares of the fragments that were not crushed.
+
+Bond events and `b3Destructible_GetBondState` report the layer of a bond. A break on a coarse
+layer is a large part coming off, a break on the finest is a crack inside a member.
 
 ## Events
 

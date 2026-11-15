@@ -347,6 +347,7 @@ static void b3InitBond( const b3StructureData* structure, b3DestructionBond* bon
 	bond->solverIndex = B3_NULL_INDEX;
 	bond->materialIndex = (uint16_t)fragmentA->materialIndex;
 	bond->flags = ( source->flags & b3_structureBondRigid ) != 0 ? b3_bondRigid : 0;
+	bond->layer = source->layer >= 0 ? (uint8_t)source->layer : B3_ANCHOR_LAYER;
 
 	// The bond is as stiff as a short beam that spans the two fragment centers.
 	float length;
@@ -531,6 +532,7 @@ static void b3FindStaticAnchors( b3World* world, const b3DestructibleDef* def, b
 				anchor.centroid = b3MulSV( 1.0f / hitCount, hitCenter );
 				anchor.normal = planes[faceIndex].normal;
 				anchor.area = faceArea * (float)hitCount / (float)sampleCount;
+				anchor.layer = B3_NULL_INDEX;
 				if ( anchor.area > 0.0f )
 				{
 					b3Array_Push( *anchors, anchor );
@@ -589,6 +591,8 @@ b3DestructibleId b3CreateDestructible( b3WorldId worldId, const b3DestructibleDe
 	destructible->debrisLifetime = def->debrisLifetime;
 	destructible->minFragmentRadius = def->minFragmentRadius;
 	destructible->strengthScale = def->strengthScale;
+	destructible->strengthLayerCount = structure->strengthLayerCount;
+	memcpy( destructible->layerStrength, structure->layerStrength, sizeof( destructible->layerStrength ) );
 	destructible->freezeSleepingDebris = def->freezeSleepingDebris;
 
 	const b3StructureMaterial* materials = b3GetStructureMaterials( structure );
@@ -622,7 +626,7 @@ b3DestructibleId b3CreateDestructible( b3WorldId worldId, const b3DestructibleDe
 	for ( int i = 0; i < fragmentCount; ++i )
 	{
 		destructible->fragmentPiece[i] = B3_FRAGMENT_DORMANT;
-		destructible->health[i] = def->strengthScale * fragments[i].health;
+		destructible->health[i] = b3GetCrushStrength( destructible ) * fragments[i].health;
 	}
 
 	for ( int i = 0; i < structure->hullCount; ++i )
@@ -1179,6 +1183,7 @@ b3BondState b3Destructible_GetBondState( b3DestructibleId destructibleId, int bo
 	state.elasticRatio = isBroken ? 0.0f : bond->elasticRatio;
 	state.fatalRatio = isBroken ? 0.0f : bond->fatalRatio;
 	state.isBroken = isBroken;
+	state.layer = bond->layer == B3_ANCHOR_LAYER ? B3_NULL_INDEX : bond->layer;
 	return state;
 }
 
@@ -1283,6 +1288,56 @@ float b3Destructible_GetStrengthScale( b3DestructibleId destructibleId )
 {
 	b3World* world = b3GetWorld( destructibleId.world0 );
 	return b3GetDestructibleFromId( world, destructibleId )->strengthScale;
+}
+
+void b3Destructible_SetLayerStrength( b3DestructibleId destructibleId, int layer, float scale )
+{
+	B3_ASSERT( b3IsValidFloat( scale ) && scale > 0.0f );
+
+	b3World* world = b3GetUnlockedWorld( destructibleId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3Destructible* destructible = b3GetDestructibleFromId( world, destructibleId );
+	B3_ASSERT( 0 <= layer && layer < destructible->strengthLayerCount );
+	if ( layer < 0 || layer >= destructible->strengthLayerCount )
+	{
+		return;
+	}
+
+	float ratio = scale / destructible->layerStrength[layer];
+	destructible->layerStrength[layer] = scale;
+
+	if ( layer == destructible->strengthLayerCount - 1 )
+	{
+		// The inside of the fragments. Their remaining health follows.
+		for ( int i = 0; i < destructible->fragmentCount; ++i )
+		{
+			destructible->health[i] *= ratio;
+		}
+
+		return;
+	}
+
+	// The limits of the bonds on this layer changed, so every piece must be looked at again
+	for ( int i = 0; i < destructible->pieces.count; ++i )
+	{
+		b3DestructionPiece* piece = destructible->pieces.data + i;
+		if ( piece->bodyId != B3_NULL_INDEX && piece->system != NULL )
+		{
+			piece->system->evaluated = false;
+		}
+	}
+}
+
+float b3Destructible_GetLayerStrength( b3DestructibleId destructibleId, int layer )
+{
+	b3World* world = b3GetWorld( destructibleId.world0 );
+	const b3Destructible* destructible = b3GetDestructibleFromId( world, destructibleId );
+	B3_ASSERT( 0 <= layer && layer < destructible->strengthLayerCount );
+	return 0 <= layer && layer < destructible->strengthLayerCount ? destructible->layerStrength[layer] : 1.0f;
 }
 
 static b3ShapeFragment b3GetShapeFragment( b3World* world, b3ShapeId shapeId )
