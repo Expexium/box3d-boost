@@ -99,6 +99,27 @@ the damage spreading along bonds and not through empty space. `b3World_Explode` 
 fragments. Use both for an explosion. `b3Destructible_DamageFragment`, `b3Destructible_BreakBond`
 and `b3Destructible_ApplyImpulse` act on single fragments and bonds.
 
+## Two modes: stress or damage only
+
+A destructible runs in one of two modes, chosen with `b3DestructibleDef::enableStress` and
+changed at any time with `b3Destructible_EnableStress`.
+
+- **Stress**, the default. Everything above applies. A structure that loses its supports sags,
+  creaks and collapses on its own.
+- **Damage only**, with `enableStress` off. The structure carries any load, so it only breaks
+  where something hits it or where you damage it: impacts, radial damage, explosions and the
+  `b3Destructible` functions all work as before, and fragments are still crushed. Connectivity
+  still holds too. A piece that loses its last bond to the anchors falls, and it can break when
+  it lands. What does not happen is failure under load: a floor that hangs on a single column
+  stays up.
+
+Damage only suits games where a player carves holes in walls and nothing should come down that
+the player did not shoot away. It is also much cheaper: there is no stress solve, so a
+destructible costs nothing while nothing hits it, and it does not keep the solver state of its
+pieces, which is most of the memory a large structure takes.
+
+`b3DestructionSettings::enableStress` switches stress off for every destructible of a world.
+
 ## Materials
 
 `b3StructureMaterial` holds the density, the elastic and fatal limits for tension, compression
@@ -190,8 +211,9 @@ fragments.
 amount of work of the latest step. Turn on `drawBonds` and `drawBondStress` in `b3DebugDraw` to
 see the bonds colored by how close they are to breaking.
 
-Pieces are solved in parallel. The result is deterministic and does not depend on the number of
-workers.
+Pieces are solved in parallel, the largest first so that a large piece does not hold up the
+others at the end of the step. The result is deterministic and does not depend on the number of
+workers. A destructible without stress only costs a solve where something hits it.
 
 ## Authoring advice
 

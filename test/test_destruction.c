@@ -624,7 +624,7 @@ static uint32_t HashWorld( b3WorldId worldId, b3DestructibleId destructibleId )
 	return hash;
 }
 
-static uint32_t RunCollapse( int workerCount, int* bodyCount, b3Recording* recording )
+static uint32_t RunCollapse( int workerCount, bool enableStress, int* bodyCount, b3Recording* recording )
 {
 	b3WorldId worldId = CreateTestWorld( workerCount );
 	CreateGround( worldId );
@@ -639,6 +639,7 @@ static uint32_t RunCollapse( int workerCount, int* bodyCount, b3Recording* recor
 
 	b3DestructibleDef def = b3DefaultDestructibleDef();
 	def.structure = structure;
+	def.enableStress = enableStress;
 	b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
 
 	if ( recording != NULL )
@@ -673,17 +674,23 @@ static uint32_t RunCollapse( int workerCount, int* bodyCount, b3Recording* recor
 // A collapse must give the same result every time, on any number of workers.
 static int CollapseDeterminismTest( void )
 {
-	int bodyCount1 = 0, bodyCount2 = 0, bodyCount4 = 0;
-	uint32_t hash1 = RunCollapse( 1, &bodyCount1, NULL );
-	uint32_t hash2 = RunCollapse( 1, &bodyCount2, NULL );
-	uint32_t hash4 = RunCollapse( 4, &bodyCount4, NULL );
+	// With and without the stress solve
+	for ( int mode = 0; mode < 2; ++mode )
+	{
+		bool enableStress = mode == 0;
+		int bodyCount1 = 0, bodyCount2 = 0, bodyCount4 = 0;
+		uint32_t hash1 = RunCollapse( 1, enableStress, &bodyCount1, NULL );
+		uint32_t hash2 = RunCollapse( 1, enableStress, &bodyCount2, NULL );
+		uint32_t hash4 = RunCollapse( 4, enableStress, &bodyCount4, NULL );
 
-	// The blast must have done something for this to mean anything
-	ENSURE( bodyCount1 > 4 );
-	ENSURE( bodyCount1 == bodyCount2 );
-	ENSURE( hash1 == hash2 );
-	ENSURE( bodyCount1 == bodyCount4 );
-	ENSURE( hash1 == hash4 );
+		// The blast must have done something for this to mean anything
+		ENSURE( bodyCount1 > 4 );
+		ENSURE( bodyCount1 == bodyCount2 );
+		ENSURE( hash1 == hash2 );
+		ENSURE( bodyCount1 == bodyCount4 );
+		ENSURE( hash1 == hash4 );
+	}
+
 	return 0;
 }
 
@@ -1619,7 +1626,7 @@ static int CollapseRecordingTest( void )
 {
 	b3Recording* recording = b3CreateRecording( 0 );
 	int bodyCount = 0;
-	RunCollapse( 1, &bodyCount, recording );
+	RunCollapse( 1, true, &bodyCount, recording );
 	ENSURE( bodyCount > 4 );
 	ENSURE( b3Recording_GetSize( recording ) > 0 );
 
@@ -2014,6 +2021,229 @@ static int DestructionLifetimeTest( void )
 	return 0;
 }
 
+// Find a support fragment whose bounding box starts at or above a height
+static int FindFragmentAbove( const b3StructureData* structure, float height )
+{
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+	for ( int i = 0; i < structure->fragmentCount; ++i )
+	{
+		if ( fragments[i].parent == B3_NULL_INDEX && fragments[i].aabb.lowerBound.y >= height )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// Crush the lower fragments of the columns of a one bay frame on one side of x = 0
+static int CrushFrameColumns( b3DestructibleId destructibleId, const b3StructureData* structure, const BuildingDef* buildingDef,
+							  float side )
+{
+	const b3StructureFragment* fragments = b3GetStructureFragments( structure );
+	int crushed = 0;
+	for ( int i = 0; i < structure->fragmentCount; ++i )
+	{
+		const b3StructureFragment* fragment = fragments + i;
+		bool isColumn = fragment->aabb.upperBound.y < buildingDef->floorHeight - buildingDef->slabThickness + 0.01f;
+		if ( isColumn && side * fragment->center.x > 0.0f && fragment->center.y < 1.5f )
+		{
+			b3Destructible_DamageFragment( destructibleId, i, 10.0f * fragment->health );
+			crushed += 1;
+		}
+	}
+
+	return crushed;
+}
+
+// Without stress a structure carries any load. It only breaks where something hits or damages it,
+// a piece that loses its last bond to the anchors still falls, and the solver does no work while
+// nothing happens. Stress can be turned on and off at any time, per destructible and per world.
+static int StressModeTest( void )
+{
+	b3StructureMaterial material = b3DefaultStructureMaterial();
+	material.strengthVariation = 0.0f;
+
+	// A cantilever long enough to snap at its root under its own weight, see CantileverTest. The
+	// first pass turns stress off on the destructible, the second on the world.
+	int cellCount = 14;
+	b3StructureData* beam = CreateBeamStructure( 0.5f * (float)cellCount, 0.3f, 0.3f, cellCount, true, &material );
+
+	for ( int pass = 0; pass < 2; ++pass )
+	{
+		b3WorldId worldId = CreateTestWorld( 2 );
+
+		b3DestructibleDef def = b3DefaultDestructibleDef();
+		def.structure = beam;
+		def.position = (b3Pos){ 0.0f, 10.0f, 0.0f };
+		def.anchorToStatic = false;
+		def.enableBondEvents = true;
+		def.enableStress = pass == 1;
+		b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+		ENSURE( b3Destructible_IsStressEnabled( destructibleId ) == ( pass == 1 ) );
+
+		b3DestructionSettings settings = b3World_GetDestructionSettings( worldId );
+		if ( pass == 1 )
+		{
+			settings.enableStress = false;
+			b3World_SetDestructionSettings( worldId, &settings );
+		}
+
+		for ( int i = 0; i < 240; ++i )
+		{
+			b3World_Step( worldId, s_timeStep, s_subStepCount );
+
+			b3DestructionCounters counters = b3World_GetDestructionCounters( worldId );
+			ENSURE( counters.solvedPieceCount == 0 );
+			ENSURE( counters.iterationCount == 0 );
+			ENSURE( b3World_GetDestructionEvents( worldId ).bondCount == 0 );
+		}
+
+		ENSURE( b3Destructible_GetIntactBondCount( destructibleId ) == b3Destructible_GetBondCount( destructibleId ) );
+		ENSURE( b3Destructible_GetBondState( destructibleId, 1 ).fatalRatio == 0.0f );
+		int64_t bytesWithoutStress = b3World_GetDestructionCounters( worldId ).byteCount;
+
+		// With stress the beam snaps at its root
+		if ( pass == 0 )
+		{
+			b3Destructible_EnableStress( destructibleId, true );
+			ENSURE( b3Destructible_IsStressEnabled( destructibleId ) );
+		}
+		else
+		{
+			settings.enableStress = true;
+			b3World_SetDestructionSettings( worldId, &settings );
+		}
+
+		int firstBroken = -1;
+		for ( int i = 0; i < 240 && firstBroken == -1; ++i )
+		{
+			b3World_Step( worldId, s_timeStep, s_subStepCount );
+
+			// The stress system is only built once stress is on
+			if ( i == 0 )
+			{
+				ENSURE( b3World_GetDestructionCounters( worldId ).byteCount > bytesWithoutStress );
+			}
+
+			b3DestructionEvents events = b3World_GetDestructionEvents( worldId );
+			if ( events.bondCount > 0 )
+			{
+				firstBroken = events.bondEvents[0].bondIndex;
+				ENSURE( events.bondEvents[0].cause == b3_bondBreakOverload || events.bondEvents[0].cause == b3_bondBreakCreep );
+			}
+		}
+
+		ENSURE( firstBroken == 1 );
+		b3DestroyWorld( worldId );
+	}
+
+	b3DestroyStructure( beam );
+
+	// A slab on four columns. Taking away the columns on one side leaves it hanging on the other two,
+	// which holds without stress. Taking those away as well leaves nothing to hold it, and it falls.
+	{
+		b3WorldId worldId = CreateTestWorld( 1 );
+		CreateGround( worldId );
+
+		BuildingDef buildingDef = DefaultBuildingDef();
+		buildingDef.floorCount = 1;
+		buildingDef.bayCountX = 1;
+		buildingDef.bayCountZ = 1;
+		buildingDef.enableWalls = false;
+		b3StructureData* structure = CreateBuildingStructure( &buildingDef );
+
+		// The debris of a crushed fragment is too small to simulate, so a crushed column is gone
+		b3DestructibleDef def = b3DefaultDestructibleDef();
+		def.structure = structure;
+		def.enableStress = false;
+		def.enableBondEvents = true;
+		def.minFragmentRadius = 100.0f;
+		b3DestructibleId destructibleId = b3CreateDestructible( worldId, &def );
+
+		float slabBottom = buildingDef.floorHeight - buildingDef.slabThickness;
+		int slabFragment = FindFragmentAbove( structure, slabBottom - 0.01f );
+		ENSURE( slabFragment >= 0 );
+
+		ENSURE( CrushFrameColumns( destructibleId, structure, &buildingDef, -1.0f ) >= 2 );
+		b3World_Step( worldId, s_timeStep, s_subStepCount );
+		ENSURE( b3World_GetDestructionEvents( worldId ).bondCount > 0 );
+
+		for ( int i = 0; i < 240; ++i )
+		{
+			b3World_Step( worldId, s_timeStep, s_subStepCount );
+			ENSURE( b3World_GetDestructionEvents( worldId ).bondCount == 0 );
+		}
+
+		b3BodyId slabBody = b3Destructible_GetFragmentBody( destructibleId, slabFragment );
+		ENSURE( b3Body_GetType( slabBody ) == b3_staticBody );
+
+		ENSURE( CrushFrameColumns( destructibleId, structure, &buildingDef, 1.0f ) >= 2 );
+		StepWorld( worldId, 120 );
+
+		slabBody = b3Destructible_GetFragmentBody( destructibleId, slabFragment );
+		ENSURE( b3Body_GetType( slabBody ) == b3_dynamicBody );
+		// Bodies of a destructible use structure space as their frame
+		b3Pos slabPosition = b3Body_GetWorldPoint( slabBody, b3GetStructureFragments( structure )[slabFragment].center );
+		ENSURE( slabPosition.y < slabBottom - 0.5f );
+
+		b3DestroyWorld( worldId );
+		b3DestroyStructure( structure );
+	}
+
+	// A fast ball still breaks a wall without stress, and only the blow breaks bonds
+	{
+		b3WorldId worldId = CreateTestWorld( 2 );
+		CreateGround( worldId );
+
+		FractureDef fracture = DefaultFractureDef();
+		fracture.cellSize = 0.5f;
+		fracture.childSize = 0.0f;
+		b3StructureData* structure = CreateWallStructure( 6.0f, 3.0f, 0.3f, &fracture, 11 );
+
+		b3DestructibleDef def = b3DefaultDestructibleDef();
+		def.structure = structure;
+		def.enableStress = false;
+		def.enableBondEvents = true;
+		b3CreateDestructible( worldId, &def );
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = (b3Pos){ 0.0f, 1.5f, 4.0f };
+		bodyDef.linearVelocity = (b3Vec3){ 0.0f, 0.0f, -40.0f };
+		bodyDef.isBullet = true;
+		b3BodyId ballId = b3CreateBody( worldId, &bodyDef );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.density = 7800.0f;
+		b3Sphere sphere = { b3Vec3_zero, 0.4f };
+		b3CreateSphereShape( ballId, &shapeDef, &sphere );
+
+		int impactCount = 0;
+		int stressCount = 0;
+		for ( int i = 0; i < 120; ++i )
+		{
+			b3World_Step( worldId, s_timeStep, s_subStepCount );
+
+			b3DestructionEvents events = b3World_GetDestructionEvents( worldId );
+			for ( int j = 0; j < events.bondCount; ++j )
+			{
+				b3BondBreakCause cause = events.bondEvents[j].cause;
+				impactCount += cause == b3_bondBreakImpact ? 1 : 0;
+				stressCount += cause == b3_bondBreakOverload || cause == b3_bondBreakCreep ? 1 : 0;
+			}
+		}
+
+		ENSURE( impactCount > 0 );
+		ENSURE( stressCount == 0 );
+
+		b3DestroyWorld( worldId );
+		b3DestroyStructure( structure );
+	}
+
+	return 0;
+}
+
 int DestructionTest( void )
 {
 	RUN_SUBTEST( StructureCookTest );
@@ -2044,5 +2274,6 @@ int DestructionTest( void )
 	RUN_SUBTEST( EmbeddedAnchorTest );
 	RUN_SUBTEST( RestingLoadTest );
 	RUN_SUBTEST( DestructionLifetimeTest );
+	RUN_SUBTEST( StressModeTest );
 	return 0;
 }

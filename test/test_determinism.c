@@ -593,6 +593,112 @@ static int SIMDWidthTest( void )
 	return 0;
 }
 
+// Stacks of two slabs, each made of many box shapes, rest on the ground with boxes dropped on top.
+// A slab touches the ground or the other slab through more shapes than there are graph colors, so
+// most of these contacts overflow. The two slabs of a stack only touch each other, which links the
+// overflow contacts of the stack into one group. Run the scene and hash every body. Also reports
+// the largest overflow seen.
+static uint32_t RunOverflowScene( int workerCount, int* maxOverflowCount )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = workerCount;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	{
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		bodyDef.position = (b3Pos){ 0.0f, -1.0f, 0.0f };
+		b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+		b3BoxHull box = b3MakeBoxHull( 100.0f, 1.0f, 100.0f );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3CreateHullShape( groundId, &shapeDef, &box.base );
+	}
+
+	enum
+	{
+		stackCount = 6,
+		cellsPerSide = 8,
+		boxesPerStack = 4,
+		bodyCapacity = stackCount * ( 2 + boxesPerStack ),
+	};
+
+	b3BodyId bodyIds[bodyCapacity];
+	int bodyCount = 0;
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	for ( int i = 0; i < stackCount; ++i )
+	{
+		// Separate stacks, so their contacts form separate groups
+		float x = 6.0f * ( (float)i - 0.5f * (float)( stackCount - 1 ) );
+
+		// The top slab first, so the shapes of the two slabs are not in the order the slabs stack
+		for ( int level = 1; level >= 0; --level )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = (b3Pos){ x, 0.3f + 0.55f * (float)level, 0.0f };
+			b3BodyId slabId = b3CreateBody( worldId, &bodyDef );
+			bodyIds[bodyCount++] = slabId;
+
+			for ( int j = 0; j < cellsPerSide * cellsPerSide; ++j )
+			{
+				b3Vec3 center = { 0.5f * ( (float)( j % cellsPerSide ) - 3.5f ), 0.0f, 0.5f * ( (float)( j / cellsPerSide ) - 3.5f ) };
+				b3BoxHull cell = b3MakeOffsetBoxHull( 0.25f, 0.25f, 0.25f, center );
+				b3CreateHullShape( slabId, &shapeDef, &cell.base );
+			}
+		}
+
+		for ( int j = 0; j < boxesPerStack; ++j )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = (b3Pos){ x + 0.4f * (float)j - 0.6f, 2.0f + 0.7f * (float)j, 0.3f * (float)( j % 2 ) };
+			b3BodyId boxId = b3CreateBody( worldId, &bodyDef );
+			b3BoxHull box = b3MakeBoxHull( 0.3f, 0.3f, 0.3f );
+			b3CreateHullShape( boxId, &shapeDef, &box.base );
+			bodyIds[bodyCount++] = boxId;
+		}
+	}
+
+	*maxOverflowCount = 0;
+	for ( int i = 0; i < 90; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		b3Counters counters = b3World_GetCounters( worldId );
+		*maxOverflowCount = b3MaxInt( *maxOverflowCount, counters.colorCounts[B3_GRAPH_COLOR_COUNT - 1] );
+	}
+
+	uint32_t hash = B3_HASH_INIT;
+	for ( int i = 0; i < bodyCount; ++i )
+	{
+		b3WorldTransform transform = b3Body_GetTransform( bodyIds[i] );
+		hash = b3Hash( hash, (const uint8_t*)&transform, sizeof( b3WorldTransform ) );
+	}
+
+	b3DestroyWorld( worldId );
+	return hash;
+}
+
+// Overflow contacts that share no dynamic body are solved in parallel, in groups. That must give
+// exactly what one worker gives by solving them one after the other.
+static int OverflowGroupTest( void )
+{
+	int serialOverflow = 0;
+	uint32_t serialHash = RunOverflowScene( 1, &serialOverflow );
+
+	// Enough overflow for the groups to be solved in parallel
+	ENSURE( serialOverflow >= 128 );
+
+	for ( int workerCount = 2; workerCount <= 4; ++workerCount )
+	{
+		int overflow = 0;
+		uint32_t hash = RunOverflowScene( workerCount, &overflow );
+		ENSURE( overflow == serialOverflow );
+		ENSURE( hash == serialHash );
+	}
+
+	return 0;
+}
+
 int DeterminismTest( void )
 {
 	RUN_SUBTEST( MultithreadingTest );
@@ -601,6 +707,7 @@ int DeterminismTest( void )
 	RUN_SUBTEST( QuerySpawnTest );
 	RUN_SUBTEST( MeshDropTest );
 	RUN_SUBTEST( SIMDWidthTest );
+	RUN_SUBTEST( OverflowGroupTest );
 
 	return 0;
 }

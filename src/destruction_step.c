@@ -22,6 +22,7 @@
 #include "box3d/destruction.h"
 
 #include <float.h>
+#include <stdlib.h>
 #include <string.h>
 
 // A fragment ignores impacts that carry less than this share of its health. Keeps the countless small
@@ -132,28 +133,73 @@ void b3DestructionPreStep( b3World* world, float timeStep )
 	}
 }
 
-// Turn one solved contact into the load on the fragment at either end.
-// Does the fragment of a shape have any use for the load of a contact?
-static inline bool b3WantsContactLoad( const b3Destruction* destruction, b3ShapeFragment link, float approachSpeed )
+// Does the fragment of a shape have any use for the load of a contact? Returns the piece of the
+// fragment if it does.
+static inline const b3DestructionPiece* b3GetLoadedPiece( const b3Destruction* destruction, b3ShapeFragment link, float approachSpeed )
 {
 	const b3Destructible* destructible = destruction->destructibles.data + link.destructibleId;
 	int pieceIndex = destructible->fragmentPiece[link.fragmentIndex];
 	if ( pieceIndex < 0 )
 	{
-		return false;
+		return NULL;
 	}
 
 	const b3DestructionPiece* piece = destructible->pieces.data + pieceIndex;
 	if ( piece->flags & b3_pieceFrozen )
 	{
-		return false;
+		return NULL;
 	}
 
 	// A loose fragment has no bonds to load. Only a blow matters to it, for the energy that can
 	// crush it. Most contacts in a pile of rubble end here.
-	return piece->bondCount > 0 || approachSpeed > destruction->settings.impactVelocityThreshold;
+	if ( piece->bondCount == 0 && approachSpeed <= destruction->settings.impactVelocityThreshold )
+	{
+		return NULL;
+	}
+
+	return piece;
 }
 
+// Fill in the load on the fragment at one end of a contact. Everything that needs the transform of
+// the body is done here, on the workers, so the serial pass that follows only adds up.
+static void b3SetContactLoad( b3World* world, b3ContactLoad* load, b3ShapeFragment link, const b3DestructionPiece* piece,
+							  const b3Body* otherBody, b3Vec3 impulse, b3Vec3 anchor, float approachSpeed )
+{
+	const b3Destruction* destruction = world->destruction;
+	const b3Destructible* destructible = destruction->destructibles.data + link.destructibleId;
+	const b3StructureFragment* fragment = b3GetStructureFragments( destructible->structure ) + link.fragmentIndex;
+
+	load->destructibleId = link.destructibleId;
+	load->fragmentIndex = link.fragmentIndex;
+	load->otherBodyId = otherBody->id;
+	load->otherGeneration = otherBody->generation;
+	load->impulse = impulse;
+	load->anchor = anchor;
+	load->approachSpeed = approachSpeed;
+
+	// The body frame is structure space, so going local is a single rotation.
+	b3Body* body = world->bodies.data + piece->bodyId;
+	const b3BodySim* bodySim = b3GetBodySim( world, body );
+	b3Quat rotation = bodySim->transform.q;
+	b3Vec3 localPoint = b3Add( bodySim->localCenter, b3InvRotateVector( rotation, anchor ) );
+	load->localImpulse = b3InvRotateVector( rotation, impulse );
+	load->localAngularImpulse = b3Cross( b3Sub( localPoint, fragment->center ), load->localImpulse );
+	load->point = b3OffsetPos( bodySim->center, anchor );
+
+	// Energy the impact can spend on breaking the fragment and the bonds around it. Half the
+	// impulse times the approach speed adds up to the kinetic energy lost, however the impulse is
+	// shared between contacts. Two destructibles that hit each other split that energy.
+	load->energy = 0.0f;
+	if ( approachSpeed > destruction->settings.impactVelocityThreshold )
+	{
+		int otherBodyId = otherBody->id;
+		bool isShared = otherBodyId < destruction->bodyOwners.count && destruction->bodyOwners.data[otherBodyId] != B3_NULL_INDEX;
+		float share = isShared ? 0.5f : 1.0f;
+		load->energy = share * 0.5f * b3Length( impulse ) * approachSpeed;
+	}
+}
+
+// Turn one solved contact into the load on the fragment at either end.
 static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3ContactLoad* loads )
 {
 	const b3Destruction* destruction = world->destruction;
@@ -218,28 +264,22 @@ static void b3GatherContact( b3World* world, int contactId, int subStepCount, b3
 	const b3Body* bodyA = world->bodies.data + shapeA->bodyId;
 	const b3Body* bodyB = world->bodies.data + shapeB->bodyId;
 
-	if ( linkA.destructibleId != B3_NULL_INDEX && b3WantsContactLoad( destruction, linkA, approachSpeed ) )
+	if ( linkA.destructibleId != B3_NULL_INDEX )
 	{
-		b3ContactLoad* load = loads + 0;
-		load->destructibleId = linkA.destructibleId;
-		load->fragmentIndex = linkA.fragmentIndex;
-		load->otherBodyId = bodyB->id;
-		load->otherGeneration = bodyB->generation;
-		load->impulse = b3Neg( impulse );
-		load->anchor = b3MulSV( inverseSum, anchorA );
-		load->approachSpeed = approachSpeed;
+		const b3DestructionPiece* piece = b3GetLoadedPiece( destruction, linkA, approachSpeed );
+		if ( piece != NULL )
+		{
+			b3SetContactLoad( world, loads + 0, linkA, piece, bodyB, b3Neg( impulse ), b3MulSV( inverseSum, anchorA ), approachSpeed );
+		}
 	}
 
-	if ( linkB.destructibleId != B3_NULL_INDEX && b3WantsContactLoad( destruction, linkB, approachSpeed ) )
+	if ( linkB.destructibleId != B3_NULL_INDEX )
 	{
-		b3ContactLoad* load = loads + 1;
-		load->destructibleId = linkB.destructibleId;
-		load->fragmentIndex = linkB.fragmentIndex;
-		load->otherBodyId = bodyA->id;
-		load->otherGeneration = bodyA->generation;
-		load->impulse = impulse;
-		load->anchor = b3MulSV( inverseSum, anchorB );
-		load->approachSpeed = approachSpeed;
+		const b3DestructionPiece* piece = b3GetLoadedPiece( destruction, linkB, approachSpeed );
+		if ( piece != NULL )
+		{
+			b3SetContactLoad( world, loads + 1, linkB, piece, bodyA, impulse, b3MulSV( inverseSum, anchorB ), approachSpeed );
+		}
 	}
 }
 
@@ -463,60 +503,29 @@ static void b3ApplyCommands( b3Destructible* destructible )
 	b3Array_Clear( destructible->commands );
 }
 
-// Hand the contact loads of this step to their fragments, in structure space.
+// Hand the contact loads of this step to their fragments. The gather already brought them into
+// structure space. This runs in slot order, so the sums do not depend on the workers.
 static void b3DistributeContactLoads( b3World* world )
 {
 	b3Destruction* destruction = world->destruction;
-	float impactSpeed = destruction->settings.impactVelocityThreshold;
 
 	for ( int i = 0; i < destruction->contactLoads.count; ++i )
 	{
-		b3ContactLoad* contactLoad = destruction->contactLoads.data + i;
+		const b3ContactLoad* contactLoad = destruction->contactLoads.data + i;
 		if ( contactLoad->destructibleId == B3_NULL_INDEX )
 		{
 			continue;
 		}
 
+		// Nothing between the gather and here moves a fragment to another piece
 		b3Destructible* destructible = destruction->destructibles.data + contactLoad->destructibleId;
 		int node = contactLoad->fragmentIndex;
-		int pieceIndex = destructible->fragmentPiece[node];
-		if ( pieceIndex < 0 )
-		{
-			contactLoad->destructibleId = B3_NULL_INDEX;
-			continue;
-		}
-
-		const b3DestructionPiece* piece = destructible->pieces.data + pieceIndex;
-		if ( piece->flags & b3_pieceFrozen )
-		{
-			contactLoad->destructibleId = B3_NULL_INDEX;
-			continue;
-		}
-
-		b3Body* body = world->bodies.data + piece->bodyId;
-		const b3BodySim* bodySim = b3GetBodySim( world, body );
-		b3Quat rotation = bodySim->transform.q;
-		const b3StructureFragment* fragment = b3GetStructureFragments( destructible->structure ) + node;
-
-		// The body frame is structure space, so going local is a single rotation.
-		b3Vec3 localImpulse = b3InvRotateVector( rotation, contactLoad->impulse );
-		b3Vec3 localPoint = b3Add( bodySim->localCenter, b3InvRotateVector( rotation, contactLoad->anchor ) );
-		contactLoad->point = b3OffsetPos( bodySim->center, contactLoad->anchor );
+		B3_ASSERT( destructible->fragmentPiece[node] >= 0 );
 
 		b3NodeLoad* load = destructible->loads + node;
-		load->impulse = b3Add( load->impulse, localImpulse );
-		load->angularImpulse = b3Add( load->angularImpulse, b3Cross( b3Sub( localPoint, fragment->center ), localImpulse ) );
-
-		// Energy the impact can spend on breaking the fragment and the bonds around it. Half the
-		// impulse times the approach speed adds up to the kinetic energy lost, however the impulse is
-		// shared between contacts. Two destructibles that hit each other split that energy.
-		if ( contactLoad->approachSpeed > impactSpeed )
-		{
-			int otherBodyId = contactLoad->otherBodyId;
-			bool isShared = otherBodyId < destruction->bodyOwners.count && destruction->bodyOwners.data[otherBodyId] != B3_NULL_INDEX;
-			float share = isShared ? 0.5f : 1.0f;
-			load->energy += share * 0.5f * b3Length( contactLoad->impulse ) * contactLoad->approachSpeed;
-		}
+		load->impulse = b3Add( load->impulse, contactLoad->localImpulse );
+		load->angularImpulse = b3Add( load->angularImpulse, contactLoad->localAngularImpulse );
+		load->energy += contactLoad->energy;
 
 		b3AddLoadedNode( destructible, node );
 	}
@@ -665,6 +674,10 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 {
 	b3Destruction* destruction = world->destruction;
+	bool isStressActive = b3IsStressActive( destruction, destructible );
+
+	// Breaking a bond costs energy, so without stress only a blow that brings some can do anything
+	bool needsEnergy = destructible->minToughness > 0.0f;
 
 	for ( int i = 0; i < destructible->pieces.count; ++i )
 	{
@@ -677,6 +690,19 @@ static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 		// A piece that is waiting to be split may be in several parts. Solving it would be meaningless.
 		if ( piece->flags & ( b3_pieceFrozen | b3_pieceTopologyDirty ) )
 		{
+			continue;
+		}
+
+		if ( isStressActive == false )
+		{
+			bool hasImpact = ( piece->flags & b3_pieceHasImpact ) != 0;
+			bool hasEnergy = piece->impactEnergy > 0.0f || needsEnergy == false;
+			if ( hasImpact && hasEnergy && piece->bondCount > 0 )
+			{
+				b3PieceTask task = { destructible->id, i, 0 };
+				b3Array_Push( destruction->tasks, task );
+			}
+
 			continue;
 		}
 
@@ -721,17 +747,60 @@ static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 	}
 }
 
+// A task and the size of its piece, for scheduling
+typedef struct b3TaskOrder
+{
+	int nodeCount;
+	int taskIndex;
+} b3TaskOrder;
+
+// Larger pieces first. The task index makes this a total order.
+static int b3CompareTaskOrder( const void* a, const void* b )
+{
+	const b3TaskOrder* orderA = a;
+	const b3TaskOrder* orderB = b;
+
+	if ( orderA->nodeCount != orderB->nodeCount )
+	{
+		return orderA->nodeCount > orderB->nodeCount ? -1 : 1;
+	}
+
+	return orderA->taskIndex < orderB->taskIndex ? -1 : ( orderA->taskIndex > orderB->taskIndex ? 1 : 0 );
+}
+
+// A task costs about this many fragments of work before it gets to its fragments
+#define B3_TASK_OVERHEAD 8
+
+// The workers get about this many units of work each
+#define B3_UNITS_PER_WORKER 8
+
+typedef struct b3SolvePiecesContext
+{
+	b3World* world;
+
+	// The tasks from the largest piece to the smallest
+	const b3TaskOrder* order;
+
+	// Each unit of work is a range of the order. A large piece is a unit of its own, small ones
+	// share one, so all units take about as long.
+	const int* unitStarts;
+} b3SolvePiecesContext;
+
 static void b3SolvePiecesTask( int startIndex, int endIndex, int workerIndex, void* context )
 {
-	b3World* world = context;
+	b3SolvePiecesContext* solveContext = context;
+	b3World* world = solveContext->world;
 	b3Destruction* destruction = world->destruction;
 	b3Arena arena = world->taskContexts.data[workerIndex].arena;
 
-	for ( int i = startIndex; i < endIndex; ++i )
+	for ( int unit = startIndex; unit < endIndex; ++unit )
 	{
-		b3PieceTask* task = destruction->tasks.data + i;
-		b3Destructible* destructible = destruction->destructibles.data + task->destructibleId;
-		task->iterations = b3SolvePieceStress( world, destructible, task->pieceIndex, arena );
+		for ( int i = solveContext->unitStarts[unit]; i < solveContext->unitStarts[unit + 1]; ++i )
+		{
+			b3PieceTask* task = destruction->tasks.data + solveContext->order[i].taskIndex;
+			b3Destructible* destructible = destruction->destructibles.data + task->destructibleId;
+			task->iterations = b3SolvePieceStress( world, destructible, task->pieceIndex, arena );
+		}
 	}
 }
 
@@ -770,11 +839,47 @@ void b3DestructionAnalyze( b3World* world, b3StepContext* context )
 	destruction->profile.loads = b3GetMillisecondsAndReset( &ticks );
 
 	// The pieces are independent, so they solve in parallel. Each piece gives the same result no
-	// matter which worker runs it.
+	// matter which worker runs it. The workers take the large pieces first: one large piece can take
+	// as long as all the small ones, and if it started last everyone else would wait for it.
 	int taskCount = destruction->tasks.count;
 	if ( taskCount > 0 )
 	{
-		b3ParallelFor( world, b3SolvePiecesTask, taskCount, 1, world, "destruction solve" );
+		b3TaskOrder* order = b3StackAlloc( &world->stack, taskCount * sizeof( b3TaskOrder ), "destruction order" );
+		int* unitStarts = b3StackAlloc( &world->stack, ( taskCount + 1 ) * sizeof( int ), "destruction units" );
+
+		int totalCost = 0;
+		for ( int i = 0; i < taskCount; ++i )
+		{
+			const b3PieceTask* task = destruction->tasks.data + i;
+			const b3Destructible* destructible = destruction->destructibles.data + task->destructibleId;
+			order[i].nodeCount = destructible->pieces.data[task->pieceIndex].nodeCount;
+			order[i].taskIndex = i;
+			totalCost += order[i].nodeCount + B3_TASK_OVERHEAD;
+		}
+
+		qsort( order, taskCount, sizeof( b3TaskOrder ), b3CompareTaskOrder );
+
+		// Cut the order into units of about equal cost. The parallel-for hands out the first units
+		// first, so the large pieces start right away on different workers.
+		int unitCost = b3MaxInt( 1, totalCost / ( B3_UNITS_PER_WORKER * world->workerCount ) );
+		int unitCount = 0;
+		int cost = 0;
+		unitStarts[0] = 0;
+		for ( int i = 0; i < taskCount; ++i )
+		{
+			cost += order[i].nodeCount + B3_TASK_OVERHEAD;
+			if ( cost >= unitCost || i == taskCount - 1 )
+			{
+				unitCount += 1;
+				unitStarts[unitCount] = i + 1;
+				cost = 0;
+			}
+		}
+
+		b3SolvePiecesContext solveContext = { world, order, unitStarts };
+		b3ParallelFor( world, b3SolvePiecesTask, unitCount, 1, &solveContext, "destruction solve" );
+		b3StackFree( &world->stack, unitStarts );
+		b3StackFree( &world->stack, order );
 	}
 
 	for ( int i = 0; i < taskCount; ++i )

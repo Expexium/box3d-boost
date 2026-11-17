@@ -34,6 +34,7 @@ b3DestructibleDef b3DefaultDestructibleDef( void )
 	def.minFragmentRadius = 0.0f;
 	def.freezeSleepingDebris = false;
 	def.enableSleep = true;
+	def.enableStress = true;
 	def.enableBondEvents = false;
 	def.internalValue = B3_SECRET_COOKIE;
 	return def;
@@ -603,6 +604,7 @@ b3DestructibleId b3CreateDestructible( b3WorldId worldId, const b3DestructibleDe
 	}
 
 	destructible->enableSleep = def->enableSleep;
+	destructible->enableStress = def->enableStress;
 	destructible->enableBondEvents = def->enableBondEvents;
 	destructible->anchorBodyId = B3_NULL_INDEX;
 	destructible->hostBodyId = b3_nullBodyId;
@@ -1340,6 +1342,75 @@ float b3Destructible_GetLayerStrength( b3DestructibleId destructibleId, int laye
 	return 0 <= layer && layer < destructible->strengthLayerCount ? destructible->layerStrength[layer] : 1.0f;
 }
 
+// Bring the pieces of a destructible in line with a change of its stress mode. Without stress the
+// pieces drop their stress systems, which is most of the memory a large structure holds. With stress
+// back on they rebuild them and solve the loads of the moment from rest.
+static void b3OnStressModeChanged( b3World* world, b3Destructible* destructible, bool wasActive )
+{
+	bool isActive = b3IsStressActive( world->destruction, destructible );
+	if ( isActive == wasActive )
+	{
+		return;
+	}
+
+	for ( int i = 0; i < destructible->pieces.count; ++i )
+	{
+		b3DestructionPiece* piece = destructible->pieces.data + i;
+		if ( piece->bodyId == B3_NULL_INDEX || ( piece->flags & b3_pieceFrozen ) != 0 )
+		{
+			continue;
+		}
+
+		if ( isActive )
+		{
+			piece->flags |= b3_pieceSystemDirty | b3_pieceLoadDirty;
+			continue;
+		}
+
+		b3DestroyStressSystem( piece->system );
+		piece->system = NULL;
+		piece->flags &= ~( b3_pieceCreeping | b3_pieceUnloaded | b3_pieceLoadDirty );
+
+		// A slow failure kept this body awake. Nothing fails slowly without stress.
+		if ( piece->flags & b3_pieceSleepDisabled )
+		{
+			b3Body_EnableSleep( b3MakeBodyId( world, piece->bodyId ), destructible->enableSleep );
+			piece->flags &= ~b3_pieceSleepDisabled;
+		}
+	}
+
+	// The stress the bonds showed is gone, and the old displacements are no start for a new solve
+	for ( int i = 0; i < destructible->bondCount; ++i )
+	{
+		b3DestructionBond* bond = destructible->bonds + i;
+		bond->elasticRatio = 0.0f;
+		bond->fatalRatio = 0.0f;
+		bond->solverIndex = B3_NULL_INDEX;
+	}
+
+	memset( destructible->displacements, 0, destructible->fragmentCount * sizeof( b3DVec6 ) );
+}
+
+void b3Destructible_EnableStress( b3DestructibleId destructibleId, bool flag )
+{
+	b3World* world = b3GetUnlockedWorld( destructibleId.world0 );
+	if ( world == NULL )
+	{
+		return;
+	}
+
+	b3Destructible* destructible = b3GetDestructibleFromId( world, destructibleId );
+	bool wasActive = b3IsStressActive( world->destruction, destructible );
+	destructible->enableStress = flag;
+	b3OnStressModeChanged( world, destructible, wasActive );
+}
+
+bool b3Destructible_IsStressEnabled( b3DestructibleId destructibleId )
+{
+	b3World* world = b3GetWorld( destructibleId.world0 );
+	return b3GetDestructibleFromId( world, destructibleId )->enableStress;
+}
+
 static b3ShapeFragment b3GetShapeFragment( b3World* world, b3ShapeId shapeId )
 {
 	b3ShapeFragment none = { B3_NULL_INDEX, B3_NULL_INDEX, false };
@@ -1413,10 +1484,24 @@ void b3World_SetDestructionSettings( b3WorldId worldId, const b3DestructionSetti
 	B3_ASSERT( b3IsValidFloat( settings->impactFractureScale ) && settings->impactFractureScale >= 0.0f );
 
 	b3Destruction* destruction = b3EnsureDestruction( world );
+	bool wasEnabled = destruction->settings.enableStress;
+
 	destruction->settings = *settings;
 	destruction->settings.maxIterations = b3MaxInt( 1, settings->maxIterations );
 	destruction->settings.workBudget = b3MaxInt( 1, settings->workBudget );
 	destruction->settings.maxNewBodiesPerStep = b3MaxInt( 1, settings->maxNewBodiesPerStep );
+
+	if ( settings->enableStress != wasEnabled )
+	{
+		for ( int i = 0; i < destruction->destructibles.count; ++i )
+		{
+			b3Destructible* destructible = destruction->destructibles.data + i;
+			if ( destructible->id != B3_NULL_INDEX && destructible->structure != NULL )
+			{
+				b3OnStressModeChanged( world, destructible, wasEnabled && destructible->enableStress );
+			}
+		}
+	}
 }
 
 b3DestructionSettings b3World_GetDestructionSettings( b3WorldId worldId )

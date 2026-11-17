@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // these are useful for solver testing
 #define ITERATIONS 1
@@ -1076,6 +1077,30 @@ static void b3ExecuteBlock( b3SolverStage* stage, b3StepContext* context, b3Solv
 		case b3_stageStoreImpulses:
 			b3StoreImpulses_MeshWide( block, context, workerIndex );
 			break;
+
+		case b3_stageOverflowPrepare:
+			b3PrepareContacts_Mesh( block, context );
+			break;
+
+		case b3_stageOverflowWarmStart:
+			b3WarmStartContacts_Mesh( block, context );
+			break;
+
+		case b3_stageOverflowSolve:
+			b3PushContacts_Mesh( block, context );
+			break;
+
+		case b3_stageOverflowRelax:
+			b3SolveContacts_Mesh( block, context );
+			break;
+
+		case b3_stageOverflowRestitution:
+			b3ApplyRestitution_Mesh( block, context );
+			break;
+
+		case b3_stageOverflowStore:
+			b3StoreImpulses_Mesh( block, context, workerIndex );
+			break;
 	}
 }
 
@@ -1166,6 +1191,48 @@ static void b3ExecuteMainStage( b3SolverStage* stage, b3StepContext* context, ui
 	}
 }
 
+// One pass over the overflow contacts. When they are split into groups this is a stage the workers
+// share, otherwise the main thread does it alone. The overflow blocks are shared by every pass, so
+// the sync index goes up by one per pass.
+static void b3ExecuteOverflowPass( b3StepContext* context, b3SolverStageType type, uint32_t* syncIndex )
+{
+	if ( context->overflowStages == NULL )
+	{
+		switch ( type )
+		{
+			case b3_stageOverflowPrepare:
+				b3PrepareContacts_Overflow( context );
+				break;
+			case b3_stageOverflowWarmStart:
+				b3WarmStartContacts_Overflow( context );
+				break;
+			case b3_stageOverflowSolve:
+				b3PushContacts_Overflow( context );
+				break;
+			case b3_stageOverflowRelax:
+				b3SolveContacts_Overflow( context );
+				break;
+			case b3_stageOverflowRestitution:
+				b3ApplyRestitution_Overflow( context );
+				break;
+			case b3_stageOverflowStore:
+				b3StoreImpulses_Overflow( context );
+				break;
+			default:
+				B3_ASSERT( false );
+				break;
+		}
+
+		return;
+	}
+
+	b3SolverStage* stage = context->overflowStages + ( type - b3_stageOverflowPrepare );
+	B3_ASSERT( stage->type == type );
+	uint32_t stageIndex = (uint32_t)( stage - context->stages );
+	b3ExecuteMainStage( stage, context, ( *syncIndex << 16 ) | stageIndex );
+	*syncIndex += 1;
+}
+
 // Parallel solver task
 static void b3SolverTask( void* taskContext )
 {
@@ -1240,9 +1307,11 @@ static void b3SolverTask( void* taskContext )
 		stageIndex += 1;
 		meshSyncIndex += 1;
 
-		// Single-threaded overflow work. These constraints don't fit in the graph coloring.
+		// Overflow work. These constraints don't fit in the graph coloring. The joints are always
+		// single-threaded, the contacts can be split into groups. @see b3GroupOverflowContacts
+		uint32_t overflowSyncIndex = 1;
 		b3PrepareJoints_Overflow( context );
-		b3PrepareContacts_Overflow( context );
+		b3ExecuteOverflowPass( context, b3_stageOverflowPrepare, &overflowSyncIndex );
 
 		profile->prepareConstraints += b3GetMillisecondsAndReset( &ticks );
 
@@ -1265,7 +1334,7 @@ static void b3SolverTask( void* taskContext )
 
 			// Warm start constraints
 			b3WarmStartJoints_Overflow( context );
-			b3WarmStartContacts_Overflow( context );
+			b3ExecuteOverflowPass( context, b3_stageOverflowWarmStart, &overflowSyncIndex );
 
 			for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )
 			{
@@ -1284,7 +1353,7 @@ static void b3SolverTask( void* taskContext )
 			{
 				// Overflow constraints have lower priority. Typically these are dynamic-vs-dynamic.
 				b3SolveJoints_Overflow( context, useBias );
-				b3PushContacts_Overflow( context );
+				b3ExecuteOverflowPass( context, b3_stageOverflowSolve, &overflowSyncIndex );
 
 				for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )
 				{
@@ -1312,7 +1381,7 @@ static void b3SolverTask( void* taskContext )
 			for ( int j = 0; j < RELAX_ITERATIONS; ++j )
 			{
 				b3SolveJoints_Overflow( context, useBias );
-				b3SolveContacts_Overflow( context );
+				b3ExecuteOverflowPass( context, b3_stageOverflowRelax, &overflowSyncIndex );
 
 				for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )
 				{
@@ -1336,7 +1405,7 @@ static void b3SolverTask( void* taskContext )
 		{
 			for ( int j = 0; j < restitutionIterations; ++j )
 			{
-				b3ApplyRestitution_Overflow( context );
+				b3ExecuteOverflowPass( context, b3_stageOverflowRestitution, &overflowSyncIndex );
 
 				int iterationStageIndex = stageIndex;
 				for ( int colorIndex = 0; colorIndex < activeColorCount; ++colorIndex )
@@ -1355,7 +1424,7 @@ static void b3SolverTask( void* taskContext )
 		stageIndex += activeColorCount;
 
 		// Store impulses
-		b3StoreImpulses_Overflow( context );
+		b3ExecuteOverflowPass( context, b3_stageOverflowStore, &overflowSyncIndex );
 
 		syncBits = ( convexSyncIndex << 16 ) | stageIndex;
 		B3_ASSERT( stages[stageIndex].type == b3_stageStoreWideImpulses );
@@ -1372,7 +1441,10 @@ static void b3SolverTask( void* taskContext )
 		// Signal workers to finish
 		b3AtomicStoreU32( &context->atomicSyncBits, UINT_MAX );
 
-		B3_ASSERT( stageIndex == context->stageCount );
+		// The overflow stages sit after the others
+		int overflowStageCount = context->overflowStages != NULL ? b3_stageOverflowStore - b3_stageOverflowPrepare + 1 : 0;
+		B3_ASSERT( stageIndex + overflowStageCount == context->stageCount );
+		B3_UNUSED( overflowStageCount );
 		return;
 	}
 
@@ -1429,6 +1501,173 @@ static void b3SolverTask( void* taskContext )
 
 		lastSyncBits = syncBits;
 	}
+}
+
+// The fewest overflow contacts worth a block of their own
+#define B3_MIN_OVERFLOW_BLOCK_SIZE 32
+
+// A group of overflow contacts and its size, for sorting
+typedef struct b3OverflowGroup
+{
+	int size;
+	int index;
+} b3OverflowGroup;
+
+// Largest group first. The index makes this a total order.
+static int b3CompareOverflowGroups( const void* a, const void* b )
+{
+	const b3OverflowGroup* groupA = a;
+	const b3OverflowGroup* groupB = b;
+
+	if ( groupA->size != groupB->size )
+	{
+		return groupA->size > groupB->size ? -1 : 1;
+	}
+
+	return groupA->index < groupB->index ? -1 : ( groupA->index > groupB->index ? 1 : 0 );
+}
+
+static int b3FindOverflowRoot( int* parents, int index )
+{
+	while ( parents[index] != index )
+	{
+		parents[index] = parents[parents[index]];
+		index = parents[index];
+	}
+
+	return index;
+}
+
+// The awake index of the dynamic body on one side of a contact, or B3_NULL_INDEX for a static or
+// kinematic body. Only dynamic bodies are written by the solver.
+static inline int b3GetOverflowBody( const b3BodyState* states, int encodedBodySim )
+{
+	int index = b3DecodeAwakeIndex( encodedBodySim );
+	if ( index == B3_NULL_INDEX || ( states[index].flags & b3_dynamicFlag ) == 0 )
+	{
+		return B3_NULL_INDEX;
+	}
+
+	return index;
+}
+
+// Split the overflow contacts into groups that share no dynamic body and write them out group by
+// group, each group in the order its contacts had. Fills the blocks with whole groups of about the
+// given size and returns the number of blocks. Returns one when there is nothing to split.
+static int b3GroupOverflowContacts( b3World* world, const b3BodyState* states, int awakeBodyCount, const b3ContactSpec* specs,
+									int count, b3ContactSpec* groupedSpecs, b3SyncBlock* blocks, int blockSize )
+{
+	int* parents = b3StackAlloc( &world->stack, awakeBodyCount * sizeof( int ), "overflow parents" );
+	int* bodyGroups = b3StackAlloc( &world->stack, awakeBodyCount * sizeof( int ), "overflow body groups" );
+	int* contactGroups = b3StackAlloc( &world->stack, count * sizeof( int ), "overflow contact groups" );
+	int* cursors = b3StackAlloc( &world->stack, count * sizeof( int ), "overflow cursors" );
+	b3OverflowGroup* groups = b3StackAlloc( &world->stack, count * sizeof( b3OverflowGroup ), "overflow groups" );
+
+	for ( int i = 0; i < awakeBodyCount; ++i )
+	{
+		parents[i] = i;
+		bodyGroups[i] = B3_NULL_INDEX;
+	}
+
+	// Join the bodies of each contact. The smaller root wins, which keeps this independent of the
+	// order of the joins.
+	bool isValid = true;
+	for ( int i = 0; i < count; ++i )
+	{
+		const b3Contact* contact = world->contacts.data + specs[i].contactId;
+		int bodyA = b3GetOverflowBody( states, contact->encodedBodySimA );
+		int bodyB = b3GetOverflowBody( states, contact->encodedBodySimB );
+		if ( bodyA == B3_NULL_INDEX && bodyB == B3_NULL_INDEX )
+		{
+			// Cannot happen for a contact in the graph. Solve everything alone to be safe.
+			isValid = false;
+			break;
+		}
+
+		if ( bodyA != B3_NULL_INDEX && bodyB != B3_NULL_INDEX )
+		{
+			int rootA = b3FindOverflowRoot( parents, bodyA );
+			int rootB = b3FindOverflowRoot( parents, bodyB );
+			if ( rootA < rootB )
+			{
+				parents[rootB] = rootA;
+			}
+			else if ( rootB < rootA )
+			{
+				parents[rootA] = rootB;
+			}
+		}
+
+		contactGroups[i] = bodyA != B3_NULL_INDEX ? bodyA : bodyB;
+	}
+
+	// Number the groups in the order they first appear
+	int groupCount = 0;
+	for ( int i = 0; i < count && isValid; ++i )
+	{
+		int root = b3FindOverflowRoot( parents, contactGroups[i] );
+		if ( bodyGroups[root] == B3_NULL_INDEX )
+		{
+			bodyGroups[root] = groupCount;
+			groups[groupCount] = (b3OverflowGroup){ 0, groupCount };
+			groupCount += 1;
+		}
+
+		int group = bodyGroups[root];
+		contactGroups[i] = group;
+		groups[group].size += 1;
+	}
+
+	int blockCount = 1;
+	if ( isValid && groupCount > 1 )
+	{
+		// The largest groups go first, so the workers start on the long ones
+		qsort( groups, groupCount, sizeof( b3OverflowGroup ), b3CompareOverflowGroups );
+
+		int start = 0;
+		for ( int i = 0; i < groupCount; ++i )
+		{
+			cursors[groups[i].index] = start;
+			start += groups[i].size;
+		}
+
+		for ( int i = 0; i < count; ++i )
+		{
+			groupedSpecs[cursors[contactGroups[i]]++] = specs[i];
+		}
+
+		// Blocks of whole groups
+		blockCount = 0;
+		int blockStart = 0;
+		int blockItemCount = 0;
+		for ( int i = 0; i < groupCount; ++i )
+		{
+			blockItemCount += groups[i].size;
+			if ( blockItemCount >= blockSize || i == groupCount - 1 )
+			{
+				B3_ASSERT( blockItemCount <= UINT16_MAX );
+				b3SyncBlock* block = blocks + blockCount;
+				block->block.startIndex = blockStart;
+				block->block.count = (uint16_t)blockItemCount;
+				block->block.blockType = b3_overflowBlock;
+				block->block.colorIndex = B3_OVERFLOW_INDEX;
+				b3AtomicStoreInt( &block->syncIndex, 0 );
+
+				blockCount += 1;
+				blockStart += blockItemCount;
+				blockItemCount = 0;
+			}
+		}
+
+		B3_ASSERT( blockStart == count );
+	}
+
+	b3StackFree( &world->stack, groups );
+	b3StackFree( &world->stack, cursors );
+	b3StackFree( &world->stack, contactGroups );
+	b3StackFree( &world->stack, bodyGroups );
+	b3StackFree( &world->stack, parents );
+	return blockCount;
 }
 
 static void b3BulletBodyTask( int startIndex, int endIndex, int workerIndex, void* context )
@@ -1668,6 +1907,38 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		overflow->manifoldConstraints =
 			b3StackAlloc( &world->stack, overflowManifoldCount * sizeof( b3ManifoldConstraint ), "overflow manifolds" );
 
+		// The overflow contacts are solved one after the other while the other workers wait. They come in
+		// large numbers from bodies that touch many others through many shapes, such as the large pieces
+		// of a collapsing destructible. Contacts that share no dynamic body cannot affect each other, so
+		// they are split into groups by the dynamic bodies they join and the workers solve the groups at
+		// the same time. Each group keeps the order its contacts have in the overflow, which gives exactly
+		// the result of solving them one after the other.
+		b3ContactSpec* overflowSpecs = overflow->contacts.data;
+		b3ContactSpec* groupedOverflowSpecs = NULL;
+		b3SyncBlock* overflowBlocks = NULL;
+		int overflowBlockCount = 0;
+		if ( workerCount > 1 && overflowCount >= 2 * B3_MIN_OVERFLOW_BLOCK_SIZE )
+		{
+			// Every block but the last holds at least the block size, so this many blocks are enough
+			int overflowBlockSize = b3MaxInt( B3_MIN_OVERFLOW_BLOCK_SIZE, ( overflowCount + maxBlockCount - 1 ) / maxBlockCount );
+			int overflowBlockCapacity = overflowCount / overflowBlockSize + 1;
+
+			groupedOverflowSpecs = b3StackAlloc( &world->stack, overflowCount * sizeof( b3ContactSpec ), "grouped overflow" );
+			overflowBlocks = b3StackAlloc( &world->stack, overflowBlockCapacity * sizeof( b3SyncBlock ), "overflow blocks" );
+			overflowBlockCount = b3GroupOverflowContacts( world, stepContext->states, awakeBodyCount, overflow->contacts.data,
+														  overflowCount, groupedOverflowSpecs, overflowBlocks, overflowBlockSize );
+			B3_ASSERT( overflowBlockCount <= overflowBlockCapacity );
+
+			if ( overflowBlockCount > 1 )
+			{
+				overflowSpecs = groupedOverflowSpecs;
+			}
+			else
+			{
+				overflowBlockCount = 0;
+			}
+		}
+
 		// Build the span table for the flat prepare/store parallel-for while I slice the
 		// wide constraint buffer across colors. One entry per active color plus a sentinel
 		// at wideContactCount.
@@ -1757,7 +2028,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3ContactPrepareSpan overflowSpans[2] = { 0 };
 		overflowSpans[0].start = 0;
 		overflowSpans[0].count = overflow->contacts.count;
-		overflowSpans[0].contacts = overflow->contacts.data;
+		overflowSpans[0].contacts = overflowSpecs;
 		overflowSpans[1].start = overflow->contacts.count;
 		overflowSpans[1].count = 0;
 		overflowSpans[1].contacts = NULL;
@@ -1786,6 +2057,9 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		stageCount += 1;
 		// b3_stageStoreImpulses
 		stageCount += 1;
+		// b3_stageOverflowPrepare to b3_stageOverflowStore
+		int overflowStageCount = overflowBlockCount > 0 ? b3_stageOverflowStore - b3_stageOverflowPrepare + 1 : 0;
+		stageCount += overflowStageCount;
 
 		b3SolverStage* stages = b3StackAlloc( &world->stack, stageCount * sizeof( b3SolverStage ), "stages" );
 		b3SyncBlock* bodyBlocks = b3StackAlloc( &world->stack, bodyDim.count * sizeof( b3SyncBlock ), "body blocks" );
@@ -1866,6 +2140,14 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		stage = b3InitStage( stage, b3_stageStoreWideImpulses, convexBlocks, convexPrepareDim.count, UINT8_MAX );
 		stage = b3InitStage( stage, b3_stageStoreImpulses, meshBlocks, meshPrepareDim.count, UINT8_MAX );
 
+		// Every overflow pass shares the overflow blocks
+		b3SolverStage* overflowStages = overflowStageCount > 0 ? stage : NULL;
+		for ( int i = 0; i < overflowStageCount; ++i )
+		{
+			b3SolverStageType type = (b3SolverStageType)( b3_stageOverflowPrepare + i );
+			stage = b3InitStage( stage, type, overflowBlocks, overflowBlockCount, B3_OVERFLOW_INDEX );
+		}
+
 		B3_ASSERT( (int)( stage - stages ) == stageCount );
 
 		B3_ASSERT( workerCount <= B3_MAX_WORKERS );
@@ -1876,6 +2158,7 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		stepContext->workerCount = workerCount;
 		stepContext->stageCount = stageCount;
 		stepContext->stages = stages;
+		stepContext->overflowStages = overflowStages;
 		stepContext->wideConstraints = wideConstraints;
 		stepContext->widePrepareSpans = widePrepareSpans;
 		stepContext->wideContactCount = wideContactCount;
@@ -1991,6 +2274,11 @@ void b3Solve( b3World* world, b3StepContext* stepContext )
 		b3StackFree( &world->stack, convexBlocks );
 		b3StackFree( &world->stack, bodyBlocks );
 		b3StackFree( &world->stack, stages );
+		if ( groupedOverflowSpecs != NULL )
+		{
+			b3StackFree( &world->stack, overflowBlocks );
+			b3StackFree( &world->stack, groupedOverflowSpecs );
+		}
 		b3StackFree( &world->stack, overflow->manifoldConstraints );
 		b3StackFree( &world->stack, overflow->contactConstraints );
 		b3StackFree( &world->stack, wideMeshConstraints );
