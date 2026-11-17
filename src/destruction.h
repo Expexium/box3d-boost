@@ -278,6 +278,12 @@ enum b3PieceFlags
 
 	// The piece has no load, so its bonds carry nothing and were reset.
 	b3_pieceUnloaded = 0x2000,
+
+	// A loose piece that has come to rest. It carries its loads without failing.
+	b3_pieceSettled = 0x4000,
+
+	// Something hit the piece in this step with enough speed to count as a blow.
+	b3_pieceHasBlow = 0x8000,
 };
 
 // A bond the stress solve decided to break.
@@ -325,6 +331,9 @@ typedef struct b3DestructionPiece
 
 	// Radius of the bounding sphere about the center
 	float radius;
+
+	// Seconds a loose piece has moved slowly without taking a blow. @see b3DestructionSettings::settleTime
+	float restTime;
 
 	// NULL for a piece that needs no solve, such as a single fragment
 	b3StressSystem* system;
@@ -446,6 +455,7 @@ typedef struct b3Destructible
 	// Strength of the connections on each layer. The last one in use is the inside of the fragments.
 	float layerStrength[B3_MAX_STRENGTH_LAYERS];
 	int strengthLayerCount;
+	float sleepThreshold;
 	bool freezeSleepingDebris;
 	bool enableSleep;
 	bool enableBondEvents;

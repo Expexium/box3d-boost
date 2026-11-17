@@ -771,6 +771,23 @@ static int BuildingDemolitionTest( void )
 	ENSURE( highMass < 0.1f * totalMass );
 	MAYBE_UNUSED( maxStepTime );
 
+	// The rubble comes to rest. Once it has settled nothing breaks any more and the whole pile falls
+	// asleep, instead of crumbling on for minutes.
+	int lateBreaks = 0;
+	for ( ; stepIndex < 720; ++stepIndex )
+	{
+		StepBuildingCollapse( worldId, stepIndex );
+		b3World_Step( worldId, s_timeStep, s_subStepCount );
+
+		if ( stepIndex >= 540 )
+		{
+			lateBreaks += b3World_GetDestructionCounters( worldId ).brokenBondCount;
+		}
+	}
+
+	ENSURE( lateBreaks == 0 );
+	ENSURE( b3World_GetAwakeBodyCount( worldId ) == 0 );
+
 	DestroyBuildingCollapse();
 	b3DestroyWorld( worldId );
 	return 0;

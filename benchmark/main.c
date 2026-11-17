@@ -56,6 +56,7 @@ static void MinProfile( b3Profile* p1, const b3Profile* p2 )
 	p1->transforms = b3MinFloat( p1->transforms, p2->transforms );
 	p1->refit = b3MinFloat( p1->refit, p2->refit );
 	p1->sleepIslands = b3MinFloat( p1->sleepIslands, p2->sleepIslands );
+	p1->destruction = b3MinFloat( p1->destruction, p2->destruction );
 }
 
 // Match a name=value option in either its short or long spelling. Returns the value or NULL.
@@ -279,6 +280,7 @@ int main( int argc, char** argv )
 		.refit = FLT_MAX,
 		.bullets = FLT_MAX,
 		.sleepIslands = FLT_MAX,
+		.destruction = FLT_MAX,
 	};
 
 	b3Profile* profiles = malloc( maxSteps * sizeof( b3Profile ) );

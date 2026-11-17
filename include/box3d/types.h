@@ -596,6 +596,10 @@ typedef struct b3Profile
 	float bullets;			   //
 	float sleepIslands;		   //
 	float sensors;			   //
+	float destruction;		   // all destruction work, part of the step
+	float destructionLoads;	   // gathering contact loads and picking the pieces to solve
+	float destructionSolve;	   // stress and impact solves of the pieces
+	float destructionFracture; // breaking bonds and splitting bodies, after the rest of the step
 } b3Profile;
 
 /// Counters that give details of the simulation size.

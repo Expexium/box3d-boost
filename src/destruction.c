@@ -33,6 +33,7 @@ b3DestructibleDef b3DefaultDestructibleDef( void )
 	def.debrisLifetime = 0.0f;
 	def.minFragmentRadius = 0.0f;
 	def.freezeSleepingDebris = false;
+	def.sleepThreshold = 0.1f * b3GetLengthUnitsPerMeter();
 	def.enableSleep = true;
 	def.enableStress = true;
 	def.enableBondEvents = false;
@@ -55,6 +56,7 @@ b3DestructionSettings b3DefaultDestructionSettings( void )
 	settings.impactDamageScale = 1.0f;
 	settings.impactFractureScale = 2.0f;
 	settings.momentumTransferScale = 1.0f;
+	settings.settleTime = 1.0f;
 	settings.maxNewBodiesPerStep = 256;
 	return settings;
 }
@@ -156,6 +158,7 @@ b3BodyId b3CreateDestructionBody( b3World* world, b3Destructible* destructible, 
 	bodyDef.linearVelocity = originVelocity;
 	bodyDef.angularVelocity = angularVelocity;
 	bodyDef.enableSleep = destructible->enableSleep;
+	bodyDef.sleepThreshold = destructible->sleepThreshold;
 	bodyDef.name = destructible->name[0] != 0 ? destructible->name : NULL;
 	bodyDef.userData = destructible->userData;
 
@@ -550,6 +553,7 @@ b3DestructibleId b3CreateDestructible( b3WorldId worldId, const b3DestructibleDe
 	B3_ASSERT( b3IsValidPosition( def->position ) );
 	B3_ASSERT( b3IsValidQuat( def->rotation ) );
 	B3_ASSERT( b3IsValidFloat( def->strengthScale ) && def->strengthScale > 0.0f );
+	B3_ASSERT( b3IsValidFloat( def->sleepThreshold ) && def->sleepThreshold >= 0.0f );
 
 	b3World* world = b3GetUnlockedWorldFromId( worldId );
 	if ( world == NULL || def->structure == NULL || def->structure->version != B3_STRUCTURE_VERSION )
@@ -604,6 +608,7 @@ b3DestructibleId b3CreateDestructible( b3WorldId worldId, const b3DestructibleDe
 	}
 
 	destructible->enableSleep = def->enableSleep;
+	destructible->sleepThreshold = def->sleepThreshold;
 	destructible->enableStress = def->enableStress;
 	destructible->enableBondEvents = def->enableBondEvents;
 	destructible->anchorBodyId = B3_NULL_INDEX;
@@ -1256,6 +1261,25 @@ void b3Destructible_ApplyImpulse( b3DestructibleId destructibleId, int fragmentI
 	}
 }
 
+// The limits of the bonds changed, so every piece must be looked at again, settled ones as well
+static void b3ReviewPieces( b3Destructible* destructible )
+{
+	for ( int i = 0; i < destructible->pieces.count; ++i )
+	{
+		b3DestructionPiece* piece = destructible->pieces.data + i;
+		if ( piece->bodyId == B3_NULL_INDEX )
+		{
+			continue;
+		}
+
+		piece->restTime = 0.0f;
+		if ( piece->system != NULL )
+		{
+			piece->system->evaluated = false;
+		}
+	}
+}
+
 void b3Destructible_SetStrengthScale( b3DestructibleId destructibleId, float scale )
 {
 	B3_ASSERT( b3IsValidFloat( scale ) && scale > 0.0f );
@@ -1275,15 +1299,7 @@ void b3Destructible_SetStrengthScale( b3DestructibleId destructibleId, float sca
 		destructible->health[i] *= ratio;
 	}
 
-	// The limits changed, so every piece must be looked at again
-	for ( int i = 0; i < destructible->pieces.count; ++i )
-	{
-		b3DestructionPiece* piece = destructible->pieces.data + i;
-		if ( piece->bodyId != B3_NULL_INDEX && piece->system != NULL )
-		{
-			piece->system->evaluated = false;
-		}
-	}
+	b3ReviewPieces( destructible );
 }
 
 float b3Destructible_GetStrengthScale( b3DestructibleId destructibleId )
@@ -1323,15 +1339,7 @@ void b3Destructible_SetLayerStrength( b3DestructibleId destructibleId, int layer
 		return;
 	}
 
-	// The limits of the bonds on this layer changed, so every piece must be looked at again
-	for ( int i = 0; i < destructible->pieces.count; ++i )
-	{
-		b3DestructionPiece* piece = destructible->pieces.data + i;
-		if ( piece->bodyId != B3_NULL_INDEX && piece->system != NULL )
-		{
-			piece->system->evaluated = false;
-		}
-	}
+	b3ReviewPieces( destructible );
 }
 
 float b3Destructible_GetLayerStrength( b3DestructibleId destructibleId, int layer )
@@ -1482,6 +1490,7 @@ void b3World_SetDestructionSettings( b3WorldId worldId, const b3DestructionSetti
 	B3_ASSERT( b3IsValidFloat( settings->impactRadius ) && settings->impactRadius >= 0.0f );
 	B3_ASSERT( b3IsValidFloat( settings->impactDamageScale ) && settings->impactDamageScale >= 0.0f );
 	B3_ASSERT( b3IsValidFloat( settings->impactFractureScale ) && settings->impactFractureScale >= 0.0f );
+	B3_ASSERT( b3IsValidFloat( settings->settleTime ) && settings->settleTime >= 0.0f );
 
 	b3Destruction* destruction = b3EnsureDestruction( world );
 	bool wasEnabled = destruction->settings.enableStress;

@@ -485,6 +485,11 @@ typedef struct b3DestructibleDef
 	/// Turn debris into static rubble when it falls asleep. Static rubble never wakes.
 	bool freezeSleepingDebris;
 
+	/// Sleep velocity threshold of the bodies of this destructible, usually in meters per second.
+	/// This is twice the default of a body: the slow rocking at the tip of a long piece of rubble
+	/// would otherwise keep a whole pile awake. @see b3BodyDef::sleepThreshold
+	float sleepThreshold;
+
 	/// Can the dynamic pieces fall asleep?
 	bool enableSleep;
 
@@ -568,6 +573,14 @@ typedef struct b3DestructionSettings
 	/// Scales the momentum returned to a body whose impact broke the bonds that resisted it.
 	/// One conserves momentum. Zero turns this off.
 	float momentumTransferScale;
+
+	/// Seconds after which a loose piece has settled, if it moved slower than the impact velocity
+	/// threshold and took no blow in that time. A settled piece carries its loads without failing
+	/// until it is hit or moves again. A piece in a pile of rubble rests on many contacts, and the
+	/// rigid body solver may share the weight between them in many ways, a different one every
+	/// step. Without settling a pile keeps finding loads it cannot carry and crumbles for minutes
+	/// after a collapse. Zero turns this off. Anchored pieces never settle.
+	float settleTime;
 
 	/// The most bodies the solver may create per world step. Splits beyond this are finished in
 	/// the following steps.

@@ -1183,8 +1183,6 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 		b3DestructionAnalyze( world, &context );
 	}
 
-	world->profile.step = b3GetMilliseconds( stepTicks );
-
 	B3_ASSERT( world->stack.allocation == 0 );
 
 	// Ensure stack is large enough
@@ -1231,7 +1229,16 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 	if ( world->destruction != NULL )
 	{
 		b3DestructionCommit( world );
+
+		const b3DestructionProfile* destructionProfile = &world->destruction->profile;
+		world->profile.destruction = destructionProfile->total;
+		world->profile.destructionLoads = destructionProfile->loads;
+		world->profile.destructionSolve = destructionProfile->solve;
+		world->profile.destructionFracture = destructionProfile->fracture;
 	}
+
+	// The step includes the destruction commit, which can only run once the world is unlocked
+	world->profile.step = b3GetMilliseconds( stepTicks );
 
 	b3TracyCZoneEnd( world_step );
 	b3TracyCFrame;

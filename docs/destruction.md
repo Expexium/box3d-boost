@@ -88,6 +88,15 @@ Failure runs in rounds. Only the bonds near the worst overload break, then the l
 again. Removing a support therefore makes the load move to what remains, and the failure travels
 through the structure the way it would in the real thing.
 
+**Settling.** A loose piece that has moved slower than the impact velocity threshold and taken no
+blow for `settleTime`, one second by default, has settled. It carries its loads without failing
+until something hits it or it moves again. The rigid body solver only has to get the motion of a
+piece right. How it shares the weight between the contacts a piece rests on is up to it, and it
+shares it differently from step to step, which the stress solve sees as a load moving across the
+piece. Without settling a pile of rubble keeps finding loads it cannot carry and crumbles for
+minutes after a collapse. Parts that break off a resting piece keep its rest time, and anchored
+pieces never settle.
+
 **Impacts.** A hard contact stresses the bonds near the hit. The stress picks which bonds fail,
 and the kinetic energy lost in the hit decides how many: a bond costs its area times the material
 `toughness`. A light tap cannot shatter a wall, and the result does not depend on the time step.
@@ -206,6 +215,11 @@ falling pieces break up more when they land. `impactDamageScale` does the same f
 fragments.
 
 `maxNewBodiesPerStep` spreads large splits over several steps.
+
+Lower `settleTime` if rubble still crumbles too long after a collapse, raise it if landed pieces
+should keep breaking up for longer. `b3DestructibleDef::sleepThreshold` lets the bodies of a
+destructible fall asleep at twice the speed of a default body, because a long piece of rubble that
+rocks slowly at its tip would keep a whole pile awake.
 
 `b3World_GetDestructionProfile` and `b3World_GetDestructionCounters` report the time and the
 amount of work of the latest step. Turn on `drawBonds` and `drawBondStress` in `b3DebugDraw` to

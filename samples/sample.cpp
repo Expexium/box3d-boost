@@ -666,6 +666,8 @@ static const ImU32 s_colorSolve = IM_COL32( 102, 204, 102, 255 );
 static const ImU32 s_colorSolveChild = IM_COL32( 150, 190, 150, 255 );
 static const ImU32 s_colorConstraintChild = IM_COL32( 110, 200, 190, 255 );
 static const ImU32 s_colorSensors = IM_COL32( 200, 120, 220, 255 );
+static const ImU32 s_colorDestruction = IM_COL32( 235, 90, 75, 255 );
+static const ImU32 s_colorDestructionChild = IM_COL32( 225, 150, 135, 255 );
 static const ImU32 s_colorOther = IM_COL32( 140, 140, 140, 255 );
 
 // Well apart from both row background shades so the track reads the same on every row
@@ -711,7 +713,7 @@ void Sample::DrawProfile()
 	int count = m_profileWriteIndex - m_profileReadIndex;
 
 	// Unroll ring buffer into per-field histories.
-	constexpr int kRowCount = 22;
+	constexpr int kRowCount = 26;
 	float histories[kRowCount][m_profileCapacity];
 	float totals[kRowCount] = {};
 	for ( int i = 0; i < count; ++i )
@@ -740,6 +742,10 @@ void Sample::DrawProfile()
 		histories[19][i] = p.sleepIslands;
 		histories[20][i] = p.bullets;
 		histories[21][i] = p.sensors;
+		histories[22][i] = p.destruction;
+		histories[23][i] = p.destructionLoads;
+		histories[24][i] = p.destructionSolve;
+		histories[25][i] = p.destructionFracture;
 		for ( int j = 0; j < kRowCount; ++j )
 		{
 			totals[j] += histories[j][i];
@@ -811,6 +817,10 @@ void Sample::DrawProfile()
 		{ "sleep", 1, s_colorSolveChild },
 		{ "bullets", 1, s_colorSolveChild },
 		{ "sensors", 0, s_colorSensors },
+		{ "destruction", 0, s_colorDestruction },
+		{ "loads", 1, s_colorDestructionChild },
+		{ "stress solve", 1, s_colorDestructionChild },
+		{ "fracture", 1, s_colorDestructionChild },
 	};
 
 	float stepNow = b3MaxFloat( now[0], 0.001f );
@@ -828,7 +838,8 @@ void Sample::DrawProfile()
 		float collideT = now[2];
 		float solveT = now[3];
 		float sensorsT = now[21];
-		float otherT = b3MaxFloat( stepNow - pairsT - collideT - solveT - sensorsT, 0.0f );
+		float destructionT = now[22];
+		float otherT = b3MaxFloat( stepNow - pairsT - collideT - solveT - sensorsT - destructionT, 0.0f );
 
 		float availWidth = ImGui::GetContentRegionAvail().x;
 		float barHeight = 1.5f * fontSize;
@@ -840,6 +851,7 @@ void Sample::DrawProfile()
 		x = AddSegment( dl, availWidth, collideT, stepNow, s_colorCollide, x, cursor, barHeight );
 		x = AddSegment( dl, availWidth, solveT, stepNow, s_colorSolve, x, cursor, barHeight );
 		x = AddSegment( dl, availWidth, sensorsT, stepNow, s_colorSensors, x, cursor, barHeight );
+		x = AddSegment( dl, availWidth, destructionT, stepNow, s_colorDestruction, x, cursor, barHeight );
 		x = AddSegment( dl, availWidth, otherT, stepNow, s_colorOther, x, cursor, barHeight );
 
 		ImGui::Dummy( ImVec2( availWidth, barHeight ) );
@@ -999,6 +1011,7 @@ void Sample::DrawMetrics()
 		float collideTimes[m_profileCapacity];
 		float solveTimes[m_profileCapacity];
 		float sensorsTimes[m_profileCapacity];
+		float destructionTimes[m_profileCapacity];
 		int count = m_profileWriteIndex - m_profileReadIndex;
 		for ( int i = 0; i < count; ++i )
 		{
@@ -1009,6 +1022,7 @@ void Sample::DrawMetrics()
 			collideTimes[i] = m_profiles[index].collide;
 			solveTimes[i] = m_profiles[index].solve;
 			sensorsTimes[i] = m_profiles[index].sensors;
+			destructionTimes[i] = m_profiles[index].destruction;
 			maxValue = b3MaxFloat( stepTimes[i], maxValue );
 		}
 
@@ -1032,6 +1046,8 @@ void Sample::DrawMetrics()
 			ImPlot::PlotLine( "solve", times, solveTimes, count );
 			ImPlot::SetNextLineStyle( ImGui::ColorConvertU32ToFloat4( s_colorSensors ) );
 			ImPlot::PlotLine( "sensors", times, sensorsTimes, count );
+			ImPlot::SetNextLineStyle( ImGui::ColorConvertU32ToFloat4( s_colorDestruction ) );
+			ImPlot::PlotLine( "destruction", times, destructionTimes, count );
 			ImPlot::EndPlot();
 		}
 
