@@ -1871,6 +1871,19 @@ int b3SolvePieceStress( b3World* world, b3Destructible* destructible, int pieceI
 	b3DestructionPiece* piece = b3Array_Get( destructible->pieces, pieceIndex );
 	int iterations = 0;
 
+	if ( b3IsStressActive( destruction, destructible ) == false )
+	{
+		// Without sustained loads only the blows of this step can break bonds. The impact solve is
+		// local and needs no stress system, the sustained stress it adds to is zero.
+		B3_ASSERT( piece->system == NULL );
+		if ( piece->flags & b3_pieceHasImpact )
+		{
+			iterations += b3SolveImpact( world, destructible, piece, arena );
+		}
+
+		return iterations;
+	}
+
 	if ( piece->flags & b3_pieceSystemDirty )
 	{
 		b3BuildStressSystem( destructible, piece );
@@ -2002,14 +2015,9 @@ int b3SolvePieceStress( b3World* world, b3Destructible* destructible, int pieceI
 		minOverload = error < B3_MAX_ROUGH_ERROR ? (float)( 1.0 / ( 1.0 - error / B3_MAX_ROUGH_ERROR ) ) : FLT_MAX;
 	}
 
-	if ( settings->enableStress == false )
-	{
-		minOverload = FLT_MAX;
-	}
-
 	if ( system->evaluated == false || ( piece->flags & b3_pieceCreeping ) != 0 )
 	{
-		b3EvaluateSustained( destructible, piece, destruction->timeStep, isClose && settings->enableStress, minOverload, arena );
+		b3EvaluateSustained( destructible, piece, destruction->timeStep, isClose, minOverload, arena );
 
 		if ( isClose )
 		{

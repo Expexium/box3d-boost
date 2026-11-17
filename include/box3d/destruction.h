@@ -488,6 +488,15 @@ typedef struct b3DestructibleDef
 	/// Can the dynamic pieces fall asleep?
 	bool enableSleep;
 
+	/// Let the loads the structure carries break it: its own weight, whatever rests on it, the
+	/// motion of its host and spin. This is the stress mode, where a structure that loses its
+	/// supports collapses. Turn it off for a structure that should only break where it is hit or
+	/// damaged. Impacts, radial damage, explosions and the b3Destructible functions still break
+	/// bonds and crush fragments, and a piece that loses its last bond to the anchors still falls.
+	/// Without stress a destructible costs nothing while nothing hits it.
+	/// @see b3Destructible_EnableStress
+	bool enableStress;
+
 	/// Report a b3BondEvent for every bond that breaks.
 	bool enableBondEvents;
 
@@ -508,8 +517,9 @@ B3_API b3DestructibleDef b3DefaultDestructibleDef( void );
 /// @see b3World_SetDestructionSettings
 typedef struct b3DestructionSettings
 {
-	/// Turn the stress solve on or off. When off only direct damage and b3Destructible_BreakBond
-	/// break bonds.
+	/// Turn the stress solve on or off for every destructible of the world. When off, bonds only
+	/// break from impacts and damage, as if every destructible had stress turned off.
+	/// @see b3DestructibleDef::enableStress
 	bool enableStress;
 
 	/// The most solver iterations a piece gets per world step.
@@ -859,6 +869,13 @@ B3_API void b3Destructible_SetLayerStrength( b3DestructibleId destructibleId, in
 
 /// Get the strength of the connections on one layer of this destructible
 B3_API float b3Destructible_GetLayerStrength( b3DestructibleId destructibleId, int layer );
+
+/// Turn the stress solve of this destructible on or off. This can be changed at any time.
+/// @see b3DestructibleDef::enableStress
+B3_API void b3Destructible_EnableStress( b3DestructibleId destructibleId, bool flag );
+
+/// Can the loads this destructible carries break it? @see b3DestructibleDef::enableStress
+B3_API bool b3Destructible_IsStressEnabled( b3DestructibleId destructibleId );
 
 /// Get the destructible that owns a shape. Returns a null id if the shape is not a fragment.
 /// This is useful when you get a shape id from a ray cast or an event.

@@ -78,6 +78,15 @@ typedef enum b3SolverStageType
 	b3_stageRestitution,
 	b3_stageStoreWideImpulses,
 	b3_stageStoreImpulses,
+
+	// Passes over the overflow contacts when they are split into independent groups. Each block
+	// holds whole groups. Without groups the main thread does these passes alone.
+	b3_stageOverflowPrepare,
+	b3_stageOverflowWarmStart,
+	b3_stageOverflowSolve,
+	b3_stageOverflowRelax,
+	b3_stageOverflowRestitution,
+	b3_stageOverflowStore,
 } b3SolverStageType;
 
 typedef enum b3SolverBlockType
@@ -241,6 +250,10 @@ typedef struct b3StepContext
 
 	b3SolverStage* stages;
 	int stageCount;
+
+	// The overflow stages in b3SolverStageType order, or NULL when the main thread solves the
+	// overflow alone. They sit at the end of the stage array.
+	b3SolverStage* overflowStages;
 	bool enableWarmStarting;
 
 	// padding to prevent false sharing

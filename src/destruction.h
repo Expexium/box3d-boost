@@ -298,39 +298,21 @@ typedef struct b3BondBreak
 b3DeclareArray( b3BondBreak );
 
 // A set of fragments joined by intact bonds. Moves as one rigid body.
+//
+// The fields that every step reads or resets for every piece come first, so that a pass over all
+// pieces touches a single cache line of each. A large collapse has thousands of pieces.
 typedef struct b3DestructionPiece
 {
 	// World body index or B3_NULL_INDEX for a free slot. Anchored pieces share the anchor body.
 	int bodyId;
 
-	// Fragment indices
-	int* nodes;
-	int nodeCount;
-	int nodeCapacity;
-
 	// b3PieceFlags
 	uint32_t flags;
 
-	// Mass properties in structure space, inertia about the center
-	float mass;
-	b3Vec3 center;
-	b3Matrix3 inertia;
-	b3Matrix3 invInertia;
+	int nodeCount;
 
 	// Intact bonds of this piece, including bonds to the world
 	int bondCount;
-
-	// Radius of the bounding sphere about the center
-	float radius;
-
-	// Seconds this piece has been debris
-	float age;
-
-	// NULL for a piece that needs no solve, such as a single fragment
-	b3StressSystem* system;
-
-	// Output of the analysis for this step
-	b3Array( b3BondBreak ) breaks;
 
 	// Energy in joules the impacts of this step can spend on breaking the bonds of this piece
 	float impactEnergy;
@@ -338,13 +320,35 @@ typedef struct b3DestructionPiece
 	// Share of the impact impulses on this piece that its broken bonds could not resist
 	float impactExcess;
 
-	// Scratch for the above: summed force of the bonds that broke around this piece, and the part
-	// of it above what they could carry
+	// The dynamic piece this piece split from in this step, or B3_NULL_INDEX
+	int parentPiece;
+
+	// Radius of the bounding sphere about the center
+	float radius;
+
+	// NULL for a piece that needs no solve, such as a single fragment
+	b3StressSystem* system;
+
+	// Fragment indices
+	int* nodes;
+	int nodeCapacity;
+
+	// Seconds this piece has been debris
+	float age;
+
+	// Output of the analysis for this step
+	b3Array( b3BondBreak ) breaks;
+
+	// Scratch for the impact excess: summed force of the bonds that broke around this piece, and the
+	// part of it above what they could carry
 	float breakForce;
 	float breakExcess;
 
-	// The dynamic piece this piece split from in this step, or B3_NULL_INDEX
-	int parentPiece;
+	// Mass properties in structure space, inertia about the center
+	float mass;
+	b3Vec3 center;
+	b3Matrix3 inertia;
+	b3Matrix3 invInertia;
 } b3DestructionPiece;
 
 b3DeclareArray( b3DestructionPiece );
@@ -445,6 +449,9 @@ typedef struct b3Destructible
 	bool freezeSleepingDebris;
 	bool enableSleep;
 	bool enableBondEvents;
+
+	// The application's switch for the stress solve. @see b3IsStressActive
+	bool enableStress;
 	char name[32];
 
 	// The body that holds every anchored piece. Static, or kinematic when following a host.
@@ -554,11 +561,18 @@ typedef struct b3ContactLoad
 	// Point of application relative to the center of mass of the fragment's body, world space
 	b3Vec3 anchor;
 
-	// World point of application, filled in when the load is handed to its fragment
+	// World point of application
 	b3Pos point;
+
+	// The impulse and its angular impulse about the fragment center, in structure space
+	b3Vec3 localImpulse;
+	b3Vec3 localAngularImpulse;
 
 	// Speed the shapes approached each other before the solve
 	float approachSpeed;
+
+	// Impact energy this contact hands to the fragment
+	float energy;
 } b3ContactLoad;
 
 b3DeclareArray( b3ContactLoad );
@@ -623,6 +637,13 @@ typedef struct b3Destruction
 	// True while the solver itself destroys bodies and shapes, so the destroy hooks stay quiet.
 	bool isMutating;
 } b3Destruction;
+
+// Do sustained loads break this destructible? Both the world and the destructible must allow it.
+// Without stress a piece has no stress system and only the impacts of a step are solved.
+static inline bool b3IsStressActive( const b3Destruction* destruction, const b3Destructible* destructible )
+{
+	return destruction->settings.enableStress && destructible->enableStress;
+}
 
 // Shared helpers, see destruction.c
 
