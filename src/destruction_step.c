@@ -547,7 +547,7 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 	for ( int i = 0; i < destructible->pieces.count; ++i )
 	{
 		b3DestructionPiece* piece = destructible->pieces.data + i;
-		piece->flags &= ~( b3_pieceHasLoads | b3_pieceHasImpact | b3_pieceNew | b3_pieceWasStatic );
+		piece->flags &= ~( b3_pieceHasLoads | b3_pieceHasImpact | b3_pieceHasBlow | b3_pieceNew | b3_pieceWasStatic );
 		piece->parentPiece = B3_NULL_INDEX;
 		piece->impactExcess = 0.0f;
 		piece->impactEnergy = 0.0f;
@@ -602,6 +602,13 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 		{
 			load->impulse = b3Vec3_zero;
 			load->angularImpulse = b3Vec3_zero;
+		}
+
+		// Only a contact that closed in faster than the impact speed, or a push from the application or
+		// an explosion, brings energy. That is a blow, and a piece that takes one is not at rest.
+		if ( load->energy > 0.0f )
+		{
+			piece->flags |= b3_pieceHasBlow;
 		}
 
 		// Impact energy wears the fragment down and pays for the bonds the impact breaks
@@ -670,6 +677,33 @@ static void b3UpdateLoads( b3World* world, b3Destructible* destructible )
 	}
 }
 
+// Track how long a loose piece has been at rest and return true once it has settled.
+//
+// The contact solver only has to get the motion of a piece right. How it shares the weight a piece
+// rests on between its contacts is up to it, and it shares it differently from step to step. To the
+// stress solve that looks like a load moving across the piece, and in a pile of rubble some piece
+// always seems to be overloaded somewhere. A piece that came to rest and held has nothing new to
+// fail from, so once settled it holds until something hits it or it moves again.
+static bool b3UpdateRest( const b3Destruction* destruction, b3DestructionPiece* piece, const b3BodyState* state )
+{
+	const b3DestructionSettings* settings = &destruction->settings;
+	float speed = b3Length( state->linearVelocity ) + b3Length( state->angularVelocity ) * piece->radius;
+	bool isQuiet = speed < settings->impactVelocityThreshold && ( piece->flags & b3_pieceHasBlow ) == 0;
+	piece->restTime = isQuiet ? piece->restTime + destruction->timeStep : 0.0f;
+
+	bool isSettled = settings->settleTime > 0.0f && piece->restTime >= settings->settleTime;
+	if ( isSettled )
+	{
+		piece->flags |= b3_pieceSettled;
+	}
+	else
+	{
+		piece->flags &= ~b3_pieceSettled;
+	}
+
+	return isSettled;
+}
+
 // Pick the pieces that need a stress solve in this step.
 static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 {
@@ -681,7 +715,7 @@ static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 
 	for ( int i = 0; i < destructible->pieces.count; ++i )
 	{
-		const b3DestructionPiece* piece = destructible->pieces.data + i;
+		b3DestructionPiece* piece = destructible->pieces.data + i;
 		if ( piece->bodyId == B3_NULL_INDEX )
 		{
 			continue;
@@ -727,13 +761,26 @@ static void b3BuildTasks( b3World* world, b3Destructible* destructible )
 				continue;
 			}
 
+			const b3BodyState* state = b3GetBodyState( world, body );
+			if ( b3UpdateRest( destruction, piece, state ) )
+			{
+				// A settled piece needs one more visit if it was failing slowly, to stop that and let
+				// its body sleep again
+				if ( piece->flags & ( b3_pieceCreeping | b3_pieceSleepDisabled ) )
+				{
+					b3PieceTask task = { destructible->id, i, 0 };
+					b3Array_Push( destruction->tasks, task );
+				}
+
+				continue;
+			}
+
 			needsSolve = isDirty || ( piece->flags & ( b3_pieceHasLoads | b3_pieceCreeping | b3_pieceHasImpact ) ) != 0 ||
 						 ( piece->flags & b3_pieceUnloaded ) == 0;
 
 			if ( needsSolve == false )
 			{
 				// A fast spin pulls a piece apart even in free flight
-				const b3BodyState* state = b3GetBodyState( world, body );
 				float rimSpeed = b3Length( state->angularVelocity ) * piece->radius;
 				needsSolve = rimSpeed > B3_SPIN_SPEED_THRESHOLD;
 			}
@@ -1462,6 +1509,10 @@ static void b3SplitPiece( b3World* world, b3Destructible* destructible, int piec
 		newPiece->nodeCount = part->count;
 		newPiece->bondCount = part->bondCount;
 		newPiece->flags = b3_pieceSystemDirty | b3_pieceLoadDirty | b3_pieceNew;
+
+		// A part of a piece that rests still rests. Otherwise every split in a pile would start the
+		// wait for settling over, and the pile could crumble on and on.
+		newPiece->restTime = piece->restTime;
 
 		for ( int j = 0; j < part->count; ++j )
 		{

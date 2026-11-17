@@ -1884,6 +1884,21 @@ int b3SolvePieceStress( b3World* world, b3Destructible* destructible, int pieceI
 		return iterations;
 	}
 
+	if ( piece->flags & b3_pieceSettled )
+	{
+		// The piece came to rest and carries its loads. A slow failure that was under way stops, and
+		// the loads held for a solve are dropped so the next solve after the piece wakes up takes the
+		// loads of that moment.
+		piece->flags &= ~b3_pieceCreeping;
+		piece->flags |= b3_pieceLoadDirty;
+		if ( piece->system != NULL )
+		{
+			piece->system->loadsValid = false;
+		}
+
+		return 0;
+	}
+
 	if ( piece->flags & b3_pieceSystemDirty )
 	{
 		b3BuildStressSystem( destructible, piece );

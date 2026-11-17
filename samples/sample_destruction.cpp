@@ -245,6 +245,8 @@ public:
 		changed |= ImGui::SliderFloat( "Impact fracture", &settings->impactFractureScale, 0.0f, 8.0f, "%.1f" );
 		changed |= ImGui::SliderFloat( "Impact crush", &settings->impactDamageScale, 0.0f, 8.0f, "%.1f" );
 		changed |= ImGui::SliderFloat( "Momentum transfer", &settings->momentumTransferScale, 0.0f, 1.0f, "%.2f" );
+		changed |= ImGui::SliderFloat( "Settle time", &settings->settleTime, 0.0f, 5.0f, "%.1f s" );
+		ImGui::SetItemTooltip( "Loose pieces that rest this long stop failing under their loads. Zero lets a pile crumble on." );
 		changed |= ImGui::SliderInt( "Work budget", &settings->workBudget, 10000, 1000000 );
 		changed |= ImGui::SliderInt( "New bodies per step", &settings->maxNewBodiesPerStep, 8, 1024 );
 		if ( changed )
